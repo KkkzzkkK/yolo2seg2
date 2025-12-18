@@ -33,8 +33,6 @@ from image_utils import (
 # ============================================================================
 # 配置
 # ============================================================================
-DEFAULT_INPUT_DIR = "pic"
-DEFAULT_LABEL_DIR = "labels"
 DEFAULT_INPUT_DIR = r"F:\code\pic"              # 存放影像的根目录（每个影像一个子文件夹）
 DEFAULT_LABEL_DIR = r"F:\1218\labels_export"           # YOLO 标签文件夹（每个影像一个 txt）
 DEFAULT_OUTPUT_DIR = r"I:\251218\yolo_pic"
@@ -42,6 +40,157 @@ DEFAULT_RESULTS_JSON_DIR = r"I:\251218\results_json_global"
 DEFAULT_GLOBAL_OUTPUT_DIR = r"I:\251218\results_json_global_converted"
 DEFAULT_BOX_SCALE = 1.3
 DEFAULT_SCENE_EXPAND = 3.0
+
+
+def _list_some_dirs(root: str, limit: int = 10) -> List[str]:
+    try:
+        names = [
+            d for d in os.listdir(root)
+            if os.path.isdir(os.path.join(root, d))
+        ]
+    except Exception:
+        return []
+    names.sort()
+    return names[:limit]
+
+
+def find_scene_dir(pic_root: str, scene_name: str) -> str:
+    """在 pic_root 下定位场景目录。
+
+    兼容以下数据组织方式：
+    1) pic_root/scene_name/xxx.tif
+    2) pic_root 本身就是场景目录（直接包含 tif）
+    3) pic_root 下存在相近命名的目录（大小写不敏感、前缀/包含匹配）
+    4) 两级目录：pic_root/*/scene_name
+    """
+    # 1) 直拼路径
+    direct = os.path.join(pic_root, scene_name)
+    if os.path.isdir(direct):
+        return direct
+
+    # 2) pic_root 本身就是场景目录
+    try:
+        if any(
+            f.lower().endswith((".tif", ".tiff")) and "thumb" not in f.lower()
+            for f in os.listdir(pic_root)
+            if os.path.isfile(os.path.join(pic_root, f))
+        ):
+            return pic_root
+    except Exception:
+        pass
+
+    scene_lower = scene_name.lower()
+    candidates: List[str] = []
+
+    # 3) 在同级子目录中做大小写不敏感匹配
+    try:
+        for d in os.listdir(pic_root):
+            full = os.path.join(pic_root, d)
+            if not os.path.isdir(full):
+                continue
+            dl = d.lower()
+            if dl == scene_lower:
+                return full
+            if dl.startswith(scene_lower) or scene_lower in dl:
+                candidates.append(full)
+    except Exception:
+        candidates = []
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # 4) 两级目录查找：pic_root/*/scene_name
+    try:
+        for d in os.listdir(pic_root):
+            full = os.path.join(pic_root, d)
+            if not os.path.isdir(full):
+                continue
+            try:
+                for c in os.listdir(full):
+                    sub = os.path.join(full, c)
+                    if os.path.isdir(sub) and c.lower() == scene_lower:
+                        return sub
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    sample_dirs = _list_some_dirs(pic_root, limit=10)
+    msg = (
+        f"Scene folder not found under pic_root.\n"
+        f"  scene_name: {scene_name}\n"
+        f"  pic_root:  {pic_root}\n"
+        f"  tried:     {direct}\n"
+    )
+    if candidates:
+        show = "\n".join([f"    - {p}" for p in candidates[:10]])
+        msg += f"  candidates (name match):\n{show}\n"
+    if sample_dirs:
+        msg += "  sample subfolders under pic_root:\n" + "\n".join([f"    - {d}" for d in sample_dirs]) + "\n"
+    msg += "  hint: 请检查 --input-dir 是否指向影像根目录（包含场景子文件夹），或直接指向该场景目录。"
+    raise FileNotFoundError(msg)
+
+
+def find_scene_json_dir(results_json_root: str, scene_name: str) -> str:
+    """在 results_json_root 下定位场景对应的 JSON 目录。
+
+    兼容：
+    1) results_json_root/scene_name/*.json
+    2) 大小写不敏感的同级子目录匹配
+    3) 两级目录：results_json_root/*/scene_name
+    """
+    direct = os.path.join(results_json_root, scene_name)
+    if os.path.isdir(direct):
+        return direct
+
+    scene_lower = scene_name.lower()
+
+    # 同级目录大小写不敏感匹配
+    try:
+        for d in os.listdir(results_json_root):
+            full = os.path.join(results_json_root, d)
+            if os.path.isdir(full) and d.lower() == scene_lower:
+                return full
+    except Exception:
+        pass
+
+    # 两级目录查找
+    try:
+        for d in os.listdir(results_json_root):
+            full = os.path.join(results_json_root, d)
+            if not os.path.isdir(full):
+                continue
+            try:
+                for c in os.listdir(full):
+                    sub = os.path.join(full, c)
+                    if os.path.isdir(sub) and c.lower() == scene_lower:
+                        return sub
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return ""
+
+
+def try_parse_det_idx_from_name(filename: str) -> int:
+    """从文件名解析 det_idx。
+
+    支持：seg_000_global.json / det_000_global.json
+    返回：det_idx 或 -1
+    """
+    name = os.path.basename(filename)
+    if not name.lower().endswith(".json"):
+        return -1
+    stem = os.path.splitext(name)[0]
+    parts = stem.split("_")
+    # 期望：seg / det + idx + global
+    if len(parts) >= 3 and parts[0].lower() in ("seg", "det") and parts[2].lower() == "global":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return -1
+    return -1
 
 
 def parse_args():
@@ -108,16 +257,14 @@ def resolve_scene_files(label_file: str, pic_root: str):
     else:
         base_prefix, suffix_hint = label_stem, ""
 
-    scene_dir = os.path.join(pic_root, base_prefix)
-    if not os.path.isdir(scene_dir):
-        raise FileNotFoundError(f"Scene folder not found: {scene_dir}")
+    scene_dir = find_scene_dir(pic_root, base_prefix)
 
     tiffs = [
         f for f in os.listdir(scene_dir)
         if f.lower().endswith((".tif", ".tiff")) and "thumb" not in f.lower()
     ]
     if len(tiffs) < 2:
-        raise FileNotFoundError(f"{scene_dir} 中未找到足够的 .tiff 文件")
+        raise FileNotFoundError(f"{scene_dir} 中未找到足够的 .tiff/.tif 文件（需要至少 PAN+MSS 两个）")
 
     infos = []
     for tif in tiffs:
@@ -600,23 +747,43 @@ def main():
             metadata_list = compute_crop_metadata(label_path, pic_root, crop_output_dir, args)
             all_metadata[scene_name] = metadata_list
 
+            meta_by_det_idx = {m.get("det_idx"): m for m in metadata_list if isinstance(m, dict) and "det_idx" in m}
+
             # 保存全局YOLO标签
             global_labels_dir = os.path.join(global_output_dir, "global_labels")
             for meta in metadata_list:
                 save_global_yolo_label(meta, global_labels_dir)
 
             # 转换 results_json
-            scene_json_dir = os.path.join(results_json_dir, scene_name)
+            scene_json_dir = find_scene_json_dir(results_json_dir, scene_name)
             global_json_dir = os.path.join(global_output_dir, "global_results_json", scene_name)
 
-            if os.path.isdir(scene_json_dir):
-                for meta in metadata_list:
-                    det_idx = meta["det_idx"]
-                    json_path = os.path.join(scene_json_dir, f"seg_{det_idx:03d}_global.json")
-                    if os.path.exists(json_path):
-                        output_json_path = os.path.join(global_json_dir, f"seg_{det_idx:03d}_global.json")
+            if scene_json_dir and os.path.isdir(scene_json_dir):
+                converted_cnt = 0
+                skipped_cnt = 0
+                for root, _, files in os.walk(scene_json_dir):
+                    for fn in files:
+                        if not fn.lower().endswith(".json"):
+                            continue
+                        det_idx = try_parse_det_idx_from_name(fn)
+                        if det_idx < 0:
+                            continue
+                        meta = meta_by_det_idx.get(det_idx)
+                        if not meta:
+                            skipped_cnt += 1
+                            continue
+                        json_path = os.path.join(root, fn)
+                        output_json_path = os.path.join(global_json_dir, fn)
                         convert_json_to_global(json_path, meta, output_json_path, pan_rpc)
-                        print(f"  转换JSON: seg_{det_idx:03d}")
+                        converted_cnt += 1
+                        print(f"  转换JSON: {fn}")
+
+                if converted_cnt == 0:
+                    print(f"  [warn] 未在 {scene_json_dir} 中找到可转换的 seg/det JSON")
+                elif skipped_cnt > 0:
+                    print(f"  [warn] 有 {skipped_cnt} 个 JSON 未找到对应 det_idx 元数据，已跳过")
+            else:
+                print(f"  [info] 未找到该场景的 results_json 目录，跳过 JSON 转换")
         except Exception as exc:
             print(f"[error] {scene_name}: {exc}")
 
