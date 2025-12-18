@@ -35,9 +35,11 @@ from image_utils import (
 # ============================================================================
 DEFAULT_INPUT_DIR = "pic"
 DEFAULT_LABEL_DIR = "labels"
-DEFAULT_OUTPUT_DIR = "yolo_output"
-DEFAULT_RESULTS_JSON_DIR = "results_json"
-DEFAULT_GLOBAL_OUTPUT_DIR = "global_outputs"
+DEFAULT_INPUT_DIR = r"F:\code\pic"              # 存放影像的根目录（每个影像一个子文件夹）
+DEFAULT_LABEL_DIR = r"F:\1218\labels_export"           # YOLO 标签文件夹（每个影像一个 txt）
+DEFAULT_OUTPUT_DIR = r"I:\251218\yolo_pic"
+DEFAULT_RESULTS_JSON_DIR = r"I:\251218\results_json_global"
+DEFAULT_GLOBAL_OUTPUT_DIR = r"I:\251218\results_json_global_converted"
 DEFAULT_BOX_SCALE = 1.3
 DEFAULT_SCENE_EXPAND = 3.0
 
@@ -610,12 +612,11 @@ def main():
             if os.path.isdir(scene_json_dir):
                 for meta in metadata_list:
                     det_idx = meta["det_idx"]
-                    json_path = os.path.join(scene_json_dir, f"det_{det_idx:03d}_fused.json")
+                    json_path = os.path.join(scene_json_dir, f"seg_{det_idx:03d}_global.json")
                     if os.path.exists(json_path):
                         output_json_path = os.path.join(global_json_dir, f"seg_{det_idx:03d}_global.json")
                         convert_json_to_global(json_path, meta, output_json_path, pan_rpc)
-                        print(f"  转换JSON: det_{det_idx:03d}")
-
+                        print(f"  转换JSON: seg_{det_idx:03d}")
         except Exception as exc:
             print(f"[error] {scene_name}: {exc}")
 
