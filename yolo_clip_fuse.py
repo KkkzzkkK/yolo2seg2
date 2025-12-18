@@ -40,9 +40,9 @@ import cv2
 # ============================================================================
 # 用户配置区（如果不想用命令行参数，直接修改下面的默认值）
 # ============================================================================
-DEFAULT_INPUT_DIR = "pic"              # 存放影像的根目录（每个影像一个子文件夹）
-DEFAULT_LABEL_DIR = "labels"           # YOLO 标签文件夹（每个影像一个 txt）
-DEFAULT_OUTPUT_DIR = "yolo_output"
+DEFAULT_INPUT_DIR = r"F:\code\pic"              # 存放影像的根目录（每个影像一个子文件夹）
+DEFAULT_LABEL_DIR = r"F:\平台测试样本检测结果\labels_export"           # YOLO 标签文件夹（每个影像一个 txt）
+DEFAULT_OUTPUT_DIR = r"F:\平台测试样本检测结果\yolo_pic"
 
 
 
@@ -57,7 +57,7 @@ DEFAULT_BOX_SCALE = 1.3                # 放大检测框，形成更大矩形
 DEFAULT_MAX_DETECTIONS = 500           # 保护性上限
 DEFAULT_SHARPEN_METHOD = "gram_schmidt"  # brovey/ihs/gram_schmidt/mean
 DEFAULT_SCENE_EXPAND = 3.0             # 计算场景大窗时，对所有检测外包框的放大倍数
-DEFAULT_CROP_MULTIPLE = 256            # 裁剪尺寸的倍数（256, 512 等正方形）
+DEFAULT_CROP_MULTIPLE = 64            # 裁剪尺寸的倍数（256, 512 等正方形）
 ENABLE_FEATURE_REFINE = True           # ORB/SIFT 特征微调
 FEATURE_MAX = 1200
 FEATURE_MIN_MATCH = 18
