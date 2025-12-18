@@ -13,6 +13,7 @@
 2. **坐标转换** (`convert_coords_to_global.py`)
    - 将分块图的局部坐标转换为原始大图的全局坐标
    - 支持 YOLO txt 标签和 JSON 分割结果的转换
+   - 自动从 RPB 文件提取经纬度信息，输出 geo_polygon 字段
 
 ## 目录结构
 
@@ -93,19 +94,23 @@ class x1 y1 x2 y2 x3 y3 x4 y4 [score]
 ```json
 [
   {
-    "Key_area_id": "0",
-    "Key_area_type": "genset",
-    "polygon": [[0.0234, 0.0456], ...],
-    "polygon_pixel": [[683.5, 1234.2], ...],
-    "crop_metadata": {
-      "global_offset_x": 12345,
-      "global_offset_y": 6789,
-      "crop_width": 2450,
-      "crop_height": 2966
-    }
+    "key_area_id": "0",
+    "key_area_type": "genset",
+    "polygon": [
+      [0.2597945205479452, 0.4073859522085445],
+      [0.2931506849315068, 0.3508542780456175],
+      ...
+    ],
+    "geo_polygon": [
+      [116.12345678, 39.67890123],
+      [116.12456789, 39.67891234],
+      ...
+    ]
   }
 ]
 ```
+- `polygon`: 归一化坐标（相对于原图 PAN，范围 0-1）
+- `geo_polygon`: 经纬度坐标（从 RPB 文件提取，格式 [经度, 纬度]）
 
 ## 使用方法
 
@@ -181,6 +186,16 @@ global_norm_x = global_px / pan_width
 global_norm_y = global_py / pan_height
 ```
 
+**经纬度坐标转换（基于 RPC）：**
+```python
+# 原图像素坐标 → 经纬度坐标
+lon, lat = image_to_ground_rpc(global_px, global_py, pan_rpc, height_offset)
+geo_polygon = [[lon1, lat1], [lon2, lat2], ...]
+```
+- 使用 RPC（Rational Polynomial Coefficients）进行精确的像素到地理坐标转换
+- 从 `.rpb` 文件中提取 RPC 参数
+- 如果没有 RPB 文件，`geo_polygon` 将填充为 `[0.0, 0.0]`
+
 ## 处理流程
 
 ```
@@ -204,10 +219,12 @@ global_norm_y = global_py / pan_height
 │                convert_coords_to_global.py                      │
 ├─────────────────────────────────────────────────────────────────┤
 │  1. 加载元数据（优先使用精确元数据，否则估算）                    │
-│  2. 读取 results_json 分割结果                                   │
-│  3. 转换坐标：分块归一化 → 原图归一化/像素                        │
-│  4. 保存全局 YOLO 标签                                           │
-│  5. 保存全局 JSON 结果                                           │
+│  2. 读取 RPB 文件提取 RPC 参数（如果可用）                        │
+│  3. 读取 results_json 分割结果                                   │
+│  4. 转换坐标：分块归一化 → 原图归一化                             │
+│  5. 转换经纬度：原图像素 → 经纬度（使用 RPC）                     │
+│  6. 保存全局 YOLO 标签                                           │
+│  7. 保存全局 JSON 结果（含 polygon 和 geo_polygon）              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -224,7 +241,9 @@ opencv-python
 
 1. **精度问题**：如果没有 `det_xxx_metadata.json`，坐标转换脚本会通过重新计算来估算偏移，精度可能略低。建议重新运行 `yolo_clip_fuse.py` 生成精确元数据。
 
-2. **RPC 文件**：如果影像目录中存在 `.rpb` 文件，将使用 RPC 进行精确配准；否则使用仿射变换。
+2. **RPC 文件**：
+   - 如果影像目录中存在 `.rpb` 文件，将使用 RPC 进行精确配准和经纬度转换
+   - 没有 RPB 文件时，使用仿射变换进行配准，`geo_polygon` 字段将填充为 `[0.0, 0.0]`
 
 3. **内存管理**：程序逐个处理检测框，避免内存溢出。
 
@@ -233,6 +252,8 @@ opencv-python
    - 输出裁剪：PNG
    - 坐标文件：TXT (YOLO格式), JSON
 
+5. **经纬度精度**：经纬度坐标的精度取决于 RPC 参数的质量和迭代求解的收敛性（默认 20 次迭代）。
+
 ## 示例
 
 ```bash
@@ -240,6 +261,25 @@ opencv-python
 python yolo_clip_fuse.py
 python convert_coords_to_global.py
 
-# 查看转换后的全局坐标
+# 查看转换后的全局坐标（含经纬度）
 cat global_outputs/global_results_json/GF2_xxx/det_000_global.json
+```
+
+### 输出示例
+
+```json
+[
+  {
+    "key_area_id": "0",
+    "key_area_type": "genset",
+    "polygon": [
+      [0.2597945205479452, 0.4073859522085445],
+      [0.2931506849315068, 0.3508542780456175]
+    ],
+    "geo_polygon": [
+      [116.38765432, 39.89123456],
+      [116.38876543, 39.89234567]
+    ]
+  }
+]
 ```

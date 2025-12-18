@@ -413,7 +413,7 @@ def compute_crop_metadata(label_path: str, pic_root: str, crop_output_dir: str, 
     return metadata_list
 
 
-def convert_json_to_global(json_path: str, metadata: Dict, output_path: str):
+def convert_json_to_global(json_path: str, metadata: Dict, output_path: str, pan_rpc: dict = None):
     """
     将results_json中的坐标转换为相对于原图的坐标。
 
@@ -421,7 +421,7 @@ def convert_json_to_global(json_path: str, metadata: Dict, output_path: str):
     1. labelme格式: {"version": ..., "shapes": [{"points": [...], ...}]}
     2. 简单列表格式: [{"polygon": [...], ...}]
 
-    输出JSON格式: 保持原格式，坐标转换为原图像素坐标
+    输出JSON格式: 保持原格式，坐标转换为原图像素坐标和经纬度坐标
     """
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -431,11 +431,13 @@ def convert_json_to_global(json_path: str, metadata: Dict, output_path: str):
     global_x = metadata["global_offset_x"]
     global_y = metadata["global_offset_y"]
     pan_W, pan_H = metadata["pan_size"]
+    h_avg = pan_rpc.get("heightOffset", 0) if pan_rpc else 0
 
     def convert_points(points, is_normalized=False):
-        """转换点坐标到全局坐标"""
+        """转换点坐标到全局坐标和经纬度"""
         new_points = []
         new_points_pixel = []
+        geo_points = []
         for point in points:
             if is_normalized:
                 # 归一化坐标 -> 分块像素坐标
@@ -453,7 +455,15 @@ def convert_json_to_global(json_path: str, metadata: Dict, output_path: str):
             norm_y = global_py / pan_H
             new_points.append([norm_x, norm_y])
             new_points_pixel.append([global_px, global_py])
-        return new_points, new_points_pixel
+
+            # 原图像素坐标 -> 经纬度坐标
+            if pan_rpc:
+                lon, lat = image_to_ground_rpc(global_px, global_py, pan_rpc, h_avg, iterations=20)
+                geo_points.append([lon, lat])
+            else:
+                geo_points.append([0.0, 0.0])  # 如果没有RPC，填充0
+
+        return new_points, new_points_pixel, geo_points
 
     # 检测JSON格式
     if isinstance(data, dict) and "shapes" in data:
@@ -464,8 +474,9 @@ def convert_json_to_global(json_path: str, metadata: Dict, output_path: str):
             new_shape = shape.copy()
             if "points" in shape:
                 # labelme的points是像素坐标，不是归一化的
-                _, new_points_pixel = convert_points(shape["points"], is_normalized=False)
+                _, new_points_pixel, geo_points = convert_points(shape["points"], is_normalized=False)
                 new_shape["points"] = new_points_pixel
+                new_shape["geo_points"] = geo_points  # 添加经纬度坐标
                 new_shape["global_offset"] = {
                     "x": global_x,
                     "y": global_y,
@@ -486,15 +497,9 @@ def convert_json_to_global(json_path: str, metadata: Dict, output_path: str):
         for item in data:
             new_item = item.copy() if isinstance(item, dict) else item
             if isinstance(item, dict) and "polygon" in item:
-                new_polygon, new_polygon_pixel = convert_points(item["polygon"], is_normalized=True)
+                new_polygon, _, geo_polygon = convert_points(item["polygon"], is_normalized=True)
                 new_item["polygon"] = new_polygon  # 归一化到原图
-                new_item["polygon_pixel"] = new_polygon_pixel  # 原图像素坐标
-                new_item["crop_metadata"] = {
-                    "global_offset_x": global_x,
-                    "global_offset_y": global_y,
-                    "crop_width": crop_w,
-                    "crop_height": crop_h,
-                }
+                new_item["geo_polygon"] = geo_polygon  # 经纬度坐标
             converted_data.append(new_item)
     else:
         # 未知格式，直接返回原数据
@@ -581,6 +586,15 @@ def main():
         print(f"{'='*60}")
 
         try:
+            # 解析场景文件，获取 PAN RPB 路径
+            info = resolve_scene_files(label_path, pic_root)
+            pan_rpc = None
+            if info.get("pan_rpb") and os.path.exists(info["pan_rpb"]):
+                pan_rpc = parse_rpb_file(info["pan_rpb"])
+                print(f"  加载 RPB 文件: {os.path.basename(info['pan_rpb'])}")
+            else:
+                print(f"  [warn] 未找到 RPB 文件，经纬度将填充为 0")
+
             metadata_list = compute_crop_metadata(label_path, pic_root, crop_output_dir, args)
             all_metadata[scene_name] = metadata_list
 
@@ -598,8 +612,8 @@ def main():
                     det_idx = meta["det_idx"]
                     json_path = os.path.join(scene_json_dir, f"det_{det_idx:03d}_fused.json")
                     if os.path.exists(json_path):
-                        output_json_path = os.path.join(global_json_dir, f"det_{det_idx:03d}_global.json")
-                        convert_json_to_global(json_path, meta, output_json_path)
+                        output_json_path = os.path.join(global_json_dir, f"seg_{det_idx:03d}_global.json")
+                        convert_json_to_global(json_path, meta, output_json_path, pan_rpc)
                         print(f"  转换JSON: det_{det_idx:03d}")
 
         except Exception as exc:
