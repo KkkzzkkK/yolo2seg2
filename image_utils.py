@@ -424,15 +424,38 @@ def calculate_band_correlations(pan_band, mss_bands, sample_ratio=0.1):
     step = max(1, int(1.0 / np.sqrt(sample_ratio)))
     pan_sampled = pan_band[::step, ::step].flatten().astype(np.float64)
     
+    # 检查 PAN 波段的标准差，避免除零
+    pan_std = np.std(pan_sampled)
+    if pan_std < 1e-10:
+        # PAN 波段是常值，无法计算有意义的相关系数，使用均等权重
+        num_bands = len(mss_bands_resized)
+        return np.zeros(num_bands), np.ones(num_bands) / num_bands
+    
     correlations = []
     for band in mss_bands_resized:
         band_sampled = band[::step, ::step].flatten().astype(np.float64)
         
-        # 计算皮尔逊相关系数
-        corr = np.corrcoef(pan_sampled, band_sampled)[0, 1]
+        # 检查波段的标准差，避免除零
+        band_std = np.std(band_sampled)
+        if band_std < 1e-10:
+            # 该波段是常值，相关系数设为 0
+            correlations.append(0.0)
+            continue
+        
+        # 手动计算皮尔逊相关系数，避免 np.corrcoef 的除零警告
+        pan_centered = pan_sampled - np.mean(pan_sampled)
+        band_centered = band_sampled - np.mean(band_sampled)
+        
+        numerator = np.sum(pan_centered * band_centered)
+        denominator = np.sqrt(np.sum(pan_centered**2) * np.sum(band_centered**2))
+        
+        if denominator > 1e-10:
+            corr = numerator / denominator
+        else:
+            corr = 0.0
         
         # 处理 NaN 值
-        if np.isnan(corr):
+        if not np.isfinite(corr):
             corr = 0.0
         
         correlations.append(corr)
