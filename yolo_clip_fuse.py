@@ -170,15 +170,96 @@ def single_band_to_uint8(band: np.ndarray) -> np.ndarray:
     return (np.clip(norm, 0, 1) * 255).astype(np.uint8)
 
 
-def bands_to_uint8(bands: List[np.ndarray], method: str) -> np.ndarray:
+def bands_to_uint8(bands: List[np.ndarray], method: str, valid_mask: np.ndarray = None) -> np.ndarray:
     """
     Convert bands to uint8 RGB preview.
 
     注意：process_multispectral_to_8bit 期望输入顺序为 [B, G, R, NIR]
     大多数卫星多光谱数据（如 GF2/GF7）的波段顺序就是 [B, G, R, NIR]，
     所以这里直接传入即可。
+    
+    当提供 valid_mask 时，归一化会忽略无效区域（填充区域），避免颜色异常。
     """
+    if valid_mask is not None and np.sum(valid_mask) < valid_mask.size:
+        # 有无效区域时，使用带掩码的归一化
+        return bands_to_uint8_with_mask(bands, method, valid_mask)
     return process_multispectral_to_8bit(bands, method=method)
+
+
+def bands_to_uint8_with_mask(bands: List[np.ndarray], method: str, valid_mask: np.ndarray) -> np.ndarray:
+    """
+    带掩码的归一化 - 只使用有效像素计算统计信息，避免填充区域影响颜色。
+    
+    对于无效区域，使用有效区域的中值填充，避免极端值。
+    """
+    if len(bands) < 3:
+        raise ValueError("At least 3 bands (B, G, R) are required")
+    
+    # 确保 valid_mask 是布尔类型
+    mask_bool = valid_mask.astype(bool)
+    
+    # 提取 R, G, B 波段（输入顺序是 [B, G, R, NIR]）
+    blue_band = bands[0].astype(np.float32)
+    green_band = bands[1].astype(np.float32)
+    red_band = bands[2].astype(np.float32)
+    
+    # 只使用有效像素计算统计信息
+    all_valid = np.concatenate([
+        red_band[mask_bool],
+        green_band[mask_bool],
+        blue_band[mask_bool]
+    ])
+    
+    # #region agent log
+    _valid_ratio = float(np.sum(mask_bool)) / float(mask_bool.size) if mask_bool.size > 0 else 0
+    _valid_count = len(all_valid)
+    _invalid_stats = {"r_mean": float(np.mean(red_band[~mask_bool])) if np.any(~mask_bool) else 0, "g_mean": float(np.mean(green_band[~mask_bool])) if np.any(~mask_bool) else 0, "b_mean": float(np.mean(blue_band[~mask_bool])) if np.any(~mask_bool) else 0}
+    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"K","location":"bands_to_uint8_with_mask","message":"input_stats","data":{"valid_ratio":' + str(_valid_ratio) + ',"valid_count":' + str(_valid_count) + ',"invalid_region_means":' + str(_invalid_stats).replace("'", '"') + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+    # #endregion
+    
+    if len(all_valid) < 100:
+        # 有效像素太少，返回中灰色图像而不是尝试归一化全零/填充数据
+        # 这样可以避免紫色/极端颜色
+        h, w = bands[0].shape
+        gray_value = 128  # 中灰色
+        return np.full((h, w, 3), gray_value, dtype=np.uint8)
+    
+    # 计算有效区域的百分位
+    p_low, p_high = np.percentile(all_valid, (2, 98))
+    
+    # 归一化各通道
+    if p_high > p_low:
+        red_norm = (red_band - p_low) / (p_high - p_low)
+        green_norm = (green_band - p_low) / (p_high - p_low)
+        blue_norm = (blue_band - p_low) / (p_high - p_low)
+    else:
+        red_norm = np.zeros_like(red_band)
+        green_norm = np.zeros_like(green_band)
+        blue_norm = np.zeros_like(blue_band)
+    
+    # 裁剪到 [0, 1]
+    red_norm = np.clip(red_norm, 0, 1)
+    green_norm = np.clip(green_norm, 0, 1)
+    blue_norm = np.clip(blue_norm, 0, 1)
+    
+    # 对于无效区域，用中灰色填充（0.5），避免极端颜色
+    invalid_mask = ~mask_bool
+    if np.any(invalid_mask):
+        # 使用有效区域的中值作为填充值，而不是固定的 0.5
+        fill_r = np.median(red_norm[mask_bool]) if np.any(mask_bool) else 0.5
+        fill_g = np.median(green_norm[mask_bool]) if np.any(mask_bool) else 0.5
+        fill_b = np.median(blue_norm[mask_bool]) if np.any(mask_bool) else 0.5
+        red_norm[invalid_mask] = fill_r
+        green_norm[invalid_mask] = fill_g
+        blue_norm[invalid_mask] = fill_b
+    
+    # 堆叠为 RGB 图像
+    rgb_image = np.stack([red_norm, green_norm, blue_norm], axis=-1)
+    
+    # 转换为 8 位
+    image_8bit = (rgb_image * 255).astype(np.uint8)
+    
+    return image_8bit
 
 
 def save_raw_16bit(array: np.ndarray, path: str) -> None:
@@ -345,8 +426,12 @@ def estimate_translation(pan_uint8: np.ndarray,
                          mss_uint8: np.ndarray,
                          max_shift: int = 8) -> Tuple[float, float]:
     """
-    使用相位相关估计小范围平移偏差。
-    增大 max_shift 允许更大的滑动范围。
+    使用相位相关估计平移偏差。
+    
+    策略：
+    - 小偏移 (<=max_shift): 直接接受
+    - 中等偏移 (max_shift < shift <= 150): 需要高 response (>0.25) 才接受
+    - 大偏移 (>150): 拒绝，可能是误匹配
 
     返回 dx, dy（应用到 MSS，使其对齐 PAN）。
     """
@@ -367,7 +452,34 @@ def estimate_translation(pan_uint8: np.ndarray,
 
     shift, response = cv2.phaseCorrelate(mss_crop, pan_crop)
     dx, dy = shift
-    if abs(dx) > max_shift or abs(dy) > max_shift or not np.isfinite(dx) or not np.isfinite(dy):
+    
+    # 计算偏移幅度
+    shift_magnitude = max(abs(dx), abs(dy))
+    
+    # 决策逻辑
+    accepted = False
+    reject_reason = ""
+    
+    if not np.isfinite(dx) or not np.isfinite(dy):
+        reject_reason = "non_finite"
+    elif shift_magnitude <= max_shift:
+        # 小偏移：直接接受
+        accepted = True
+    elif shift_magnitude <= 150:
+        # 中等偏移：需要足够高的 response
+        if response >= 0.25:
+            accepted = True
+        else:
+            reject_reason = f"medium_shift_low_response({response:.3f}<0.25)"
+    else:
+        # 大偏移：拒绝
+        reject_reason = f"shift_too_large({shift_magnitude:.1f}>150)"
+    
+    # #region agent log
+    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"F","location":"estimate_translation","message":"phase_correlate_result","data":{"dx":' + str(dx) + ',"dy":' + str(dy) + ',"response":' + str(response) + ',"shift_magnitude":' + str(shift_magnitude) + ',"accepted":' + str(accepted).lower() + ',"reject_reason":"' + reject_reason + '"},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+    # #endregion
+    
+    if not accepted:
         return 0.0, 0.0
     return dx, dy
 
@@ -474,6 +586,11 @@ def warp_mss_to_pan(mss_tiles: List[np.ndarray],
     # 检查变换矩阵是否合理（避免极端变形）
     # 检查矩阵的行列式，避免过度缩放或翻转
     det = np.linalg.det(M[:2, :2])
+    # #region agent log
+    _m_diag = [float(M[0,0]), float(M[1,1])]
+    _m_off = [float(M[0,2]), float(M[1,2])]
+    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"E","location":"warp_mss_to_pan","message":"homography_matrix","data":{"det":' + str(float(det)) + ',"diag":' + str(_m_diag) + ',"offset":' + str(_m_off) + ',"abnormal":' + str(abs(det) < 0.01 or abs(det) > 100).lower() + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+    # #endregion
     if abs(det) < 0.01 or abs(det) > 100:
         print(f"[warn] 变换矩阵行列式异常: {det:.4f}，可能导致图像变形")
 
@@ -601,6 +718,9 @@ def find_feature_refine(pan_uint8: np.ndarray, mss_uint8: np.ndarray):
     kp1, des1 = detector.detectAndCompute(pan_gray, None)
     kp2, des2 = detector.detectAndCompute(mss_gray, None)
     if des1 is None or des2 is None or len(kp1) < FEATURE_MIN_MATCH or len(kp2) < FEATURE_MIN_MATCH:
+        # #region agent log
+        with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"insufficient_keypoints","data":{"kp1_count":' + str(len(kp1) if kp1 else 0) + ',"kp2_count":' + str(len(kp2) if kp2 else 0) + ',"min_required":' + str(FEATURE_MIN_MATCH) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+        # #endregion
         return None
 
     norm_flag = cv2.NORM_L2 if des1.dtype == np.float32 else cv2.NORM_HAMMING
@@ -611,11 +731,64 @@ def find_feature_refine(pan_uint8: np.ndarray, mss_uint8: np.ndarray):
         if m.distance < FEATURE_RATIO * n.distance:
             good.append(m)
     if len(good) < FEATURE_MIN_MATCH:
+        # #region agent log
+        with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"insufficient_matches","data":{"good_matches":' + str(len(good)) + ',"min_required":' + str(FEATURE_MIN_MATCH) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+        # #endregion
         return None
 
     src_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
     dst_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0)
+    
+    # #region agent log
+    _h_det = float(np.linalg.det(H[:2,:2])) if H is not None else 0.0
+    _h_diag = [float(H[0,0]), float(H[1,1])] if H is not None else [0,0]
+    _h_off = [float(H[0,2]), float(H[1,2])] if H is not None else [0,0]
+    _inliers = int(np.sum(mask)) if mask is not None else 0
+    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"homography_result","data":{"good_matches":' + str(len(good)) + ',"inliers":' + str(_inliers) + ',"det":' + str(_h_det) + ',"diag":' + str(_h_diag) + ',"offset":' + str(_h_off) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+    # #endregion
+    
+    # 验证 Homography 矩阵的合理性（细配准应该是小调整）
+    if H is None:
+        return None
+    
+    inliers = int(np.sum(mask)) if mask is not None else 0
+    if inliers < FEATURE_MIN_MATCH:
+        # #region agent log
+        with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"rejected_low_inliers","data":{"inliers":' + str(inliers) + ',"min_required":' + str(FEATURE_MIN_MATCH) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+        # #endregion
+        return None
+    
+    h_det = np.linalg.det(H[:2, :2])
+    # 行列式必须为正且非常接近1（细配准是微调，不应有明显缩放）
+    # 收紧阈值：0.95 < det < 1.05
+    if h_det <= 0 or h_det < 0.95 or h_det > 1.05:
+        # #region agent log
+        with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"rejected_bad_det","data":{"det":' + str(float(h_det)) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+        # #endregion
+        return None
+    
+    # 对角线元素应该非常接近1（细配准是微调）
+    # 收紧阈值：|diag - 1| < 0.02
+    if abs(H[0, 0] - 1) > 0.02 or abs(H[1, 1] - 1) > 0.02:
+        # #region agent log
+        with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"rejected_bad_scale","data":{"diag":[' + str(float(H[0,0])) + ',' + str(float(H[1,1])) + ']},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+        # #endregion
+        return None
+    
+    # 偏移量不应过大（细配准通常小于20像素）
+    # 收紧阈值：20像素
+    max_offset = 20.0
+    if abs(H[0, 2]) > max_offset or abs(H[1, 2]) > max_offset:
+        # #region agent log
+        with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"rejected_bad_offset","data":{"offset":[' + str(float(H[0,2])) + ',' + str(float(H[1,2])) + '],"max_allowed":' + str(max_offset) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+        # #endregion
+        return None
+    
+    # #region agent log
+    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"C","location":"find_feature_refine","message":"homography_accepted","data":{"det":' + str(float(h_det)) + ',"diag":[' + str(float(H[0,0])) + ',' + str(float(H[1,1])) + '],"offset":[' + str(float(H[0,2])) + ',' + str(float(H[1,2])) + ']},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+    # #endregion
+    
     return H
 
 
@@ -712,6 +885,9 @@ def process_label_file(label_path: str, pic_root: str, out_root: str) -> None:
                         poly_ms_px_expanded, mss_rpc, pan_rpc, h_avg, iterations=20
                     ))
                     pan_poly = [(float(p[0]), float(p[1])) for p in pan_poly]
+                    # #region agent log
+                    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"A","location":"coord_transform","message":"using_rpc","data":{"det_idx":' + str(det_idx) + ',"has_rpc":true},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                    # #endregion
                 else:
                     ms_transform = ms_ds.transform
                     pan_transform = pan_ds.transform
@@ -720,6 +896,9 @@ def process_label_file(label_path: str, pic_root: str, out_root: str) -> None:
                         gx, gy = ms_transform * (x_ms, y_ms)
                         px, py = ~pan_transform * (gx, gy)
                         pan_poly.append((px, py))
+                    # #region agent log
+                    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"A","location":"coord_transform","message":"using_geotransform","data":{"det_idx":' + str(det_idx) + ',"has_rpc":false,"ms_transform":"' + str(list(ms_transform)[:6]) + '","pan_transform":"' + str(list(pan_transform)[:6]) + '"},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                    # #endregion
 
                 # 2) 计算对齐窗口（自适应大小，以检测框为中心，允许超出边界）
                 pan_col_off, pan_row_off, pan_width, pan_height = compute_align_window(
@@ -793,7 +972,172 @@ def process_label_file(label_path: str, pic_root: str, out_root: str) -> None:
                 src_control = mss_control_pix - np.float32([mss_col_off, mss_row_off])
                 output_size = (actual_pan_w, actual_pan_h)
 
-                mss_aligned, valid_mask = warp_mss_to_pan(mss_tiles, src_control, dst_control, output_size)
+                # 在 warp 之前检查控制点映射是否合理
+                # 计算预期的 Homography 矩阵参数
+                use_simple_scale = False  # 是否使用简单 4:1 缩放回退
+                _test_det = 16.0
+                _test_diag = [4.0, 4.0]
+                if len(src_control) >= 4:
+                    try:
+                        _test_H, _ = cv2.findHomography(src_control, dst_control, 0)
+                        if _test_H is not None:
+                            _test_det = np.linalg.det(_test_H[:2, :2])
+                            _test_diag = [_test_H[0, 0], _test_H[1, 1]]
+                            # 理想值：det≈16 (4x4), diag≈[4, 4]
+                            # 收紧阈值：det 在 15.5-16.5，diag 在 3.95-4.05
+                            # 如果偏差太大，说明 RPC 映射有问题，使用简单缩放回退
+                            if abs(_test_det - 16) > 0.5 or abs(_test_diag[0] - 4) > 0.05 or abs(_test_diag[1] - 4) > 0.05:
+                                print(f"[{det_idx}] 警告: RPC 映射异常 (det={_test_det:.2f}, diag=[{_test_diag[0]:.2f}, {_test_diag[1]:.2f}])，使用简单4:1缩放")
+                                use_simple_scale = True
+                                # #region agent log
+                                with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"G","location":"pre_warp_check","message":"rpc_mapping_abnormal_fallback","data":{"det_idx":' + str(det_idx) + ',"det":' + str(float(_test_det)) + ',"diag":' + str([float(_test_diag[0]), float(_test_diag[1])]) + ',"use_simple_scale":true},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                                # #endregion
+                    except Exception:
+                        pass
+                
+                if use_simple_scale:
+                    # 回退策略：重新计算 MSS 窗口位置（假设理想 4:1 关系）并重新读取
+                    scale_factor = 4.0
+                    fallback_buffer = 100  # 额外 buffer 确保完全覆盖
+                    
+                    # 基于理想 4:1 关系重新计算 MSS 窗口位置
+                    mss_col_off_fb = int(np.floor(pan_col_off / scale_factor)) - fallback_buffer
+                    mss_row_off_fb = int(np.floor(pan_row_off / scale_factor)) - fallback_buffer
+                    mss_width_fb = int(np.ceil(pan_width / scale_factor)) + fallback_buffer * 2
+                    mss_height_fb = int(np.ceil(pan_height / scale_factor)) + fallback_buffer * 2
+                    
+                    # 检查 MSS 窗口的有效覆盖率
+                    # 如果大部分窗口在图像边界外，使用原始 RPC 计算的位置（虽然 det/diag 异常但位置可能更准确）
+                    valid_x_start = max(0, mss_col_off_fb)
+                    valid_y_start = max(0, mss_row_off_fb)
+                    valid_x_end = min(ms_w, mss_col_off_fb + mss_width_fb)
+                    valid_y_end = min(ms_h, mss_row_off_fb + mss_height_fb)
+                    valid_area = max(0, valid_x_end - valid_x_start) * max(0, valid_y_end - valid_y_start)
+                    total_area = mss_width_fb * mss_height_fb
+                    coverage_ratio = valid_area / total_area if total_area > 0 else 0
+                    
+                    # 如果有效覆盖率太低（<50%），回退到原始 RPC 计算的位置
+                    if coverage_ratio < 0.5:
+                        print(f"[{det_idx}] 简单4:1回退覆盖率过低 ({coverage_ratio:.1%})，使用原始RPC位置")
+                        mss_col_off_fb = mss_col_off
+                        mss_row_off_fb = mss_row_off
+                        mss_width_fb = mss_width
+                        mss_height_fb = mss_height
+                        # #region agent log
+                        with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"H","location":"simple_scale_fallback","message":"low_coverage_use_orig_rpc","data":{"det_idx":' + str(det_idx) + ',"coverage_ratio":' + str(float(coverage_ratio)) + ',"use_orig_mss_off":true},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                        # #endregion
+                    
+                    # #region agent log
+                    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"G","location":"simple_scale_fallback","message":"recalculated_mss_window","data":{"det_idx":' + str(det_idx) + ',"orig_mss_off":[' + str(mss_col_off) + ',' + str(mss_row_off) + '],"new_mss_off":[' + str(mss_col_off_fb) + ',' + str(mss_row_off_fb) + '],"new_mss_size":[' + str(mss_width_fb) + ',' + str(mss_height_fb) + '],"coverage_ratio":' + str(float(coverage_ratio)) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                    # #endregion
+                    
+                    # 重新读取 MSS 数据（使用校正后的窗口）
+                    mss_tiles_fb = []
+                    for b in range(num_bands):
+                        mss_win_fb = Window(mss_col_off_fb, mss_row_off_fb, mss_width_fb, mss_height_fb)
+                        sample_col = max(0, min(mss_col_off_fb, ms_w - 100))
+                        sample_row = max(0, min(mss_row_off_fb, ms_h - 100))
+                        sample_w = min(100, ms_w - sample_col)
+                        sample_h = min(100, ms_h - sample_row)
+                        if sample_w > 0 and sample_h > 0:
+                            sample = ms_ds.read(b + 1, window=Window(sample_col, sample_row, sample_w, sample_h))
+                            fill_val = float(np.mean(sample[sample > 0])) if np.any(sample > 0) else 0
+                        else:
+                            fill_val = 0
+                        tile_fb, _ = read_with_padding(ms_ds, b + 1, mss_win_fb, ms_w, ms_h, fill_value=fill_val)
+                        mss_tiles_fb.append(tile_fb)
+                    
+                    if any(tile.size == 0 for tile in mss_tiles_fb):
+                        print(f"[{det_idx}] 回退策略: MSS 数据为空，跳过")
+                        continue
+                    
+                    # 简单的 4:1 缩放矩阵
+                    # 坐标关系: (src_local + mss_off_fb) * 4 = dst_local + pan_off
+                    # => dst_local = 4 * src_local + (4 * mss_off_fb - pan_off)
+                    offset_x = scale_factor * mss_col_off_fb - pan_col_off
+                    offset_y = scale_factor * mss_row_off_fb - pan_row_off
+                    
+                    simple_M = np.float32([
+                        [scale_factor, 0, offset_x],
+                        [0, scale_factor, offset_y],
+                        [0, 0, 1]
+                    ])
+                    
+                    # 计算边界填充值
+                    border_values = compute_border_value(mss_tiles_fb, percentile=10)
+                    
+                    # Warp 每个波段
+                    mss_aligned_list = []
+                    for band, border_val in zip(mss_tiles_fb, border_values):
+                        warped = cv2.warpPerspective(
+                            band.astype(np.float32),
+                            simple_M,
+                            output_size,
+                            flags=cv2.INTER_LANCZOS4,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=border_val,
+                        )
+                        mss_aligned_list.append(warped)
+                    
+                    # 生成有效区域 mask - 需要考虑 MSS 窗口边界外的填充区域
+                    h_fb, w_fb = mss_tiles_fb[0].shape
+                    
+                    # 创建源数据有效掩码：标记 MSS 窗口中哪些像素是真实数据
+                    # 当窗口有负坐标时，部分区域是填充的
+                    src_valid_mask = np.zeros((h_fb, w_fb), dtype=np.float32)
+                    # 计算有效数据在窗口内的范围
+                    src_valid_x_start = max(0, -mss_col_off_fb)  # 如果 mss_col_off_fb < 0，有效数据从 -mss_col_off_fb 开始
+                    src_valid_y_start = max(0, -mss_row_off_fb)  # 如果 mss_row_off_fb < 0，有效数据从 -mss_row_off_fb 开始
+                    src_valid_x_end = min(w_fb, ms_w - mss_col_off_fb)  # 不超过图像右边界
+                    src_valid_y_end = min(h_fb, ms_h - mss_row_off_fb)  # 不超过图像下边界
+                    
+                    if src_valid_x_end > src_valid_x_start and src_valid_y_end > src_valid_y_start:
+                        src_valid_mask[src_valid_y_start:src_valid_y_end, src_valid_x_start:src_valid_x_end] = 1.0
+                    
+                    # #region agent log
+                    _src_valid_ratio = float(np.sum(src_valid_mask)) / float(src_valid_mask.size) if src_valid_mask.size > 0 else 0
+                    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"J","location":"simple_scale_fallback","message":"src_valid_mask_created","data":{"det_idx":' + str(det_idx) + ',"src_valid_ratio":' + str(_src_valid_ratio) + ',"valid_range_x":[' + str(src_valid_x_start) + ',' + str(src_valid_x_end) + '],"valid_range_y":[' + str(src_valid_y_start) + ',' + str(src_valid_y_end) + '],"mss_off":[' + str(mss_col_off_fb) + ',' + str(mss_row_off_fb) + ']},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                    # #endregion
+                    
+                    # Warp 源数据有效掩码到输出空间
+                    valid_mask = cv2.warpPerspective(
+                        src_valid_mask,
+                        simple_M,
+                        output_size,
+                        flags=cv2.INTER_NEAREST,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=0,
+                    )
+                    valid_mask = (valid_mask > 0.5).astype(np.uint8)
+                    mss_aligned = np.stack(mss_aligned_list, axis=0)
+                    
+                    # 更新 src_control/dst_control 以便后续 phase correlation
+                    # 现在 src 是相对于新的 mss_col_off_fb, mss_row_off_fb
+                    src_control = np.float32([
+                        [pan_col_off / scale_factor - mss_col_off_fb, pan_row_off / scale_factor - mss_row_off_fb],
+                        [(pan_col_off + pan_width) / scale_factor - mss_col_off_fb, pan_row_off / scale_factor - mss_row_off_fb],
+                        [(pan_col_off + pan_width) / scale_factor - mss_col_off_fb, (pan_row_off + pan_height) / scale_factor - mss_row_off_fb],
+                        [pan_col_off / scale_factor - mss_col_off_fb, (pan_row_off + pan_height) / scale_factor - mss_row_off_fb]
+                    ])
+                    dst_control = np.float32([
+                        [0, 0],
+                        [pan_width, 0],
+                        [pan_width, pan_height],
+                        [0, pan_height]
+                    ])
+                    
+                    # #region agent log
+                    with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"G","location":"simple_scale_warp","message":"applied_corrected_4x_scale","data":{"det_idx":' + str(det_idx) + ',"offset":[' + str(float(offset_x)) + ',' + str(float(offset_y)) + '],"mss_tile_shape":[' + str(w_fb) + ',' + str(h_fb) + '],"output_size":' + str(list(output_size)) + ',"valid_ratio":' + str(float(np.sum(valid_mask)/valid_mask.size)) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                    # #endregion
+                else:
+                    mss_aligned, valid_mask = warp_mss_to_pan(mss_tiles, src_control, dst_control, output_size)
+                # #region agent log
+                _src_mean = [float(np.mean(src_control[:,0])), float(np.mean(src_control[:,1]))]
+                _dst_mean = [float(np.mean(dst_control[:,0])), float(np.mean(dst_control[:,1]))]
+                _src_std = [float(np.std(src_control[:,0])), float(np.std(src_control[:,1]))]
+                _dst_std = [float(np.std(dst_control[:,0])), float(np.std(dst_control[:,1]))]
+                with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"D","location":"warp_mss_to_pan","message":"control_points_stats","data":{"det_idx":' + str(det_idx) + ',"src_mean":' + str(_src_mean) + ',"dst_mean":' + str(_dst_mean) + ',"src_std":' + str(_src_std) + ',"dst_std":' + str(_dst_std) + ',"num_points":' + str(len(src_control)) + '},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                # #endregion
 
                 # 7) 特征细配准（启用滑动移动）
                 if ENABLE_FEATURE_REFINE:
@@ -904,8 +1248,12 @@ def process_label_file(label_path: str, pic_root: str, out_root: str) -> None:
                     mask_crop = mask_padded
 
                 # 9) 融合（固定 Gram-Schmidt，传递有效掩码）
+                # #region agent log
+                _valid_ratio = float(np.sum(mask_crop)) / float(mask_crop.size) if mask_crop.size > 0 else 0
+                with open(r"f:\yolo2seg2\.cursor\debug.log", "a") as _lf: _lf.write('{"hypothesisId":"E","location":"fuse_pan_mss","message":"before_fusion","data":{"det_idx":' + str(det_idx) + ',"valid_ratio":' + str(_valid_ratio) + ',"pan_shape":"' + str(pan_crop.shape) + '","ms_shape":"' + str(ms_crop.shape) + '"},"timestamp":' + str(int(__import__("time").time()*1000)) + '}\n')
+                # #endregion
                 fused_bands = fuse_pan_mss(pan_crop, ms_crop, valid_mask=mask_crop)
-                fused_uint8 = bands_to_uint8(fused_bands, PREVIEW_METHOD)
+                fused_uint8 = bands_to_uint8(fused_bands, PREVIEW_METHOD, valid_mask=mask_crop)
                 save_image(fused_uint8, os.path.join(scene_out, f"det_{det_idx:03d}_fused.png"))
 
                 if SAVE_RAW_16BIT:
