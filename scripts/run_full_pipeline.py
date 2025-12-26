@@ -554,7 +554,7 @@ def crop_detections(
                 
                 # 计算检测框在裁剪图中的相对位置
                 rel_points = [
-                    ((x - crop_x) / crop_w, (y - crop_y) / crop_h)
+                    [float((x - crop_x) / crop_w), float((y - crop_y) / crop_h)]
                     for x, y in points_px
                 ]
                 
@@ -563,20 +563,20 @@ def crop_detections(
                 if pan_rpc:
                     for x, y in points_px:
                         lon, lat = image_to_ground(x, y, pan_rpc, h_avg)
-                        geo_points.append([lon, lat])
+                        geo_points.append([float(lon), float(lat)])
                 
                 # 保存元数据
                 crop_metadata = {
-                    'det_idx': det_idx,
-                    'class_id': det.class_id,
-                    'score': det.score,
-                    'global_offset_x': crop_x,
-                    'global_offset_y': crop_y,
-                    'crop_width': crop_w,
-                    'crop_height': crop_h,
-                    'fused_size': [img_w, img_h],
+                    'det_idx': int(det_idx),
+                    'class_id': int(det.class_id),
+                    'score': float(det.score) if det.score is not None else None,
+                    'global_offset_x': int(crop_x),
+                    'global_offset_y': int(crop_y),
+                    'crop_width': int(crop_w),
+                    'crop_height': int(crop_h),
+                    'fused_size': [int(img_w), int(img_h)],
                     'original_poly_norm': [
-                        [det.points[i], det.points[i+1]]
+                        [float(det.points[i]), float(det.points[i+1])]
                         for i in range(0, 8, 2)
                     ],
                     'poly_in_crop_norm': rel_points,
