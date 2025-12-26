@@ -189,7 +189,7 @@ def warp_mss_to_pan_size(
 ) -> str:
     """将 MSS 全局 warp 到 PAN 尺寸，生成临时文件
     
-    使用 cv2.warpAffine 一次性完成缩放和平移，避免分块边界不连续。
+    先 resize 到 PAN 尺寸，再应用平移偏移。
     
     Args:
         mss_ds: MSS rasterio 数据集
@@ -202,24 +202,6 @@ def warp_mss_to_pan_size(
     Returns:
         输出文件路径
     """
-    mss_w, mss_h = mss_ds.width, mss_ds.height
-    
-    # 构建仿射变换矩阵：先缩放，再平移
-    # 目标坐标 = M @ 源坐标
-    # pan_x = mss_x * scale_x + offset_x
-    # 所以 mss_x = (pan_x - offset_x) / scale_x
-    # 但 warpAffine 是从目标到源的映射，所以需要逆变换
-    # 我们需要的是：对于 PAN 空间的每个点 (px, py)，找到 MSS 空间的对应点
-    # mss_x = (px - total_offset_pan[0]) / scale_x
-    # mss_y = (py - total_offset_pan[1]) / scale_y
-    
-    # warpAffine 的 M 矩阵定义：dst(x,y) = src(M[0,0]*x + M[0,1]*y + M[0,2], M[1,0]*x + M[1,1]*y + M[1,2])
-    # 所以 M = [[1/scale_x, 0, -offset_x/scale_x], [0, 1/scale_y, -offset_y/scale_y]]
-    M = np.array([
-        [1.0 / scale_x, 0, -total_offset_pan[0] / scale_x],
-        [0, 1.0 / scale_y, -total_offset_pan[1] / scale_y]
-    ], dtype=np.float64)
-    
     # 创建输出文件
     profile = {
         'driver': 'GTiff',
@@ -234,6 +216,14 @@ def warp_mss_to_pan_size(
     }
     
     print(f"[warp] 生成配准后的 MSS: {pan_w}x{pan_h}, {num_bands} 波段")
+    print(f"[warp] 偏移: dx={total_offset_pan[0]:.2f}, dy={total_offset_pan[1]:.2f}")
+    
+    # 平移矩阵：将 MSS 平移 offset 像素
+    # 正偏移表示 MSS 需要向右/下移动
+    M_translate = np.array([
+        [1, 0, total_offset_pan[0]],
+        [0, 1, total_offset_pan[1]]
+    ], dtype=np.float32)
     
     with rasterio.open(output_path, 'w', **profile) as dst:
         for b in range(num_bands):
@@ -241,10 +231,13 @@ def warp_mss_to_pan_size(
             # 读取整个波段
             mss_band = mss_ds.read(b + 1).astype(np.float32)
             
-            # 使用 warpAffine 进行全局变换
+            # 1. 先 resize 到 PAN 尺寸
+            mss_resized = cv2.resize(mss_band, (pan_w, pan_h), interpolation=cv2.INTER_CUBIC)
+            
+            # 2. 再应用平移
             warped = cv2.warpAffine(
-                mss_band,
-                M,
+                mss_resized,
+                M_translate,
                 (pan_w, pan_h),
                 flags=cv2.INTER_CUBIC,
                 borderMode=cv2.BORDER_CONSTANT,
@@ -635,6 +628,12 @@ def crop_detections(
                 # 从 TIFF 读取裁剪区域
                 crop_window = Window(crop_x, crop_y, crop_w, crop_h)
                 crop_data = fused_ds.read(window=crop_window)
+                
+                # 调试：检查数据范围
+                data_min = crop_data.min()
+                data_max = crop_data.max()
+                if data_max == 0:
+                    print(f"[{det_idx}] 警告: 裁剪区域数据全为 0，可能在 MSS 无效区域")
                 
                 # 转换为 RGB 并保存（只用 BGR 三个波段，不注入 NIR）
                 rgb_bands = [crop_data[i] for i in range(min(3, crop_data.shape[0]))]
