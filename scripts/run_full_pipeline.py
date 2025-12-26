@@ -222,77 +222,107 @@ def fuse_scene(
         print(f"缩放比例: x={scale_x:.4f}, y={scale_y:.4f}")
         
         # ================================================================
-        # 采样配准（使用 RegistrationProcessor）
+        # RPC 粗配准（使用原始尺寸计算偏移）
         # ================================================================
-        print("[配准] 采样并进行两阶段配准...")
+        print("[配准] 计算 RPC 粗配准偏移...")
         
-        # 采样参数 - 采样到约 2000x2000 大小
-        sample_size = 2000
-        sample_step_pan = max(1, max(pan_w, pan_h) // sample_size)
+        from rs_processor.core.rpc_utils import estimate_offset_from_rpcs
         
-        # 读取采样数据
-        pan_sample = pan_ds.read(1)[::sample_step_pan, ::sample_step_pan]
-        sample_h, sample_w = pan_sample.shape
+        rpc_offset_orig = (0.0, 0.0)
+        feature_offset_orig = (0.0, 0.0)
+        feature_match_count = 0
+        feature_refine_success = False
         
-        # 读取 MSS 采样并重采样到 PAN 采样大小
-        mss_sample_list = []
-        for b in range(num_bands):
-            mss_band = mss_ds.read(b + 1)
-            mss_resized = cv2.resize(mss_band, (pan_w, pan_h), interpolation=cv2.INTER_CUBIC)
-            mss_sample_list.append(mss_resized[::sample_step_pan, ::sample_step_pan])
-        mss_sample = np.stack(mss_sample_list, axis=0)
-        
-        # 使用 RegistrationProcessor 进行配准
-        offset_info = None
         if pan_rpc and mss_rpc:
+            # 使用原始尺寸计算 RPC 偏移
+            rpc_offset_orig = estimate_offset_from_rpcs(
+                pan_rpc, mss_rpc,
+                pan_size=(pan_w, pan_h),
+                mss_size=(mss_w, mss_h)
+            )
+            print(f"[粗配准] RPC 偏移: dx={rpc_offset_orig[0]:.2f}, dy={rpc_offset_orig[1]:.2f} (PAN 像素)")
+            
+            # ================================================================
+            # 特征点精配准（在采样数据上进行）
+            # ================================================================
+            print("[配准] 采样并进行特征点精配准...")
+            
+            # 采样参数 - 采样到约 2000x2000 大小
+            sample_size = 2000
+            sample_step_pan = max(1, max(pan_w, pan_h) // sample_size)
+            
+            # 读取采样数据
+            pan_sample = pan_ds.read(1)[::sample_step_pan, ::sample_step_pan]
+            sample_h, sample_w = pan_sample.shape
+            
+            # 读取 MSS 并应用 RPC 偏移后采样
+            # 先将 MSS 重采样到 PAN 尺寸，应用偏移，再采样
+            mss_sample_list = []
+            for b in range(num_bands):
+                mss_band = mss_ds.read(b + 1)
+                # 重采样到 PAN 尺寸
+                mss_resized = cv2.resize(mss_band, (pan_w, pan_h), interpolation=cv2.INTER_CUBIC)
+                # 应用 RPC 偏移（平移）
+                M = np.float32([[1, 0, -rpc_offset_orig[0]], [0, 1, -rpc_offset_orig[1]]])
+                mss_shifted = cv2.warpAffine(mss_resized, M, (pan_w, pan_h), 
+                                             flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
+                # 采样
+                mss_sample_list.append(mss_shifted[::sample_step_pan, ::sample_step_pan])
+            mss_sample = np.stack(mss_sample_list, axis=0)
+            
+            # 使用 ORB 进行特征点精配准
             registrator = RegistrationProcessor(
                 enable_feature_refine=True,
                 feature_max=2000,
-                feature_min_match=20,
-                refine_method=REFINE_METHOD,
+                feature_min_match=10,
+                refine_method='orb',  # 强制使用 ORB，因为数据已经对齐
             )
             
-            # 在采样数据上做配准
-            reg_result = registrator.register(
-                pan_data=pan_sample,
-                pan_rpc=pan_rpc,
-                mss_data=mss_sample,
-                mss_rpc=mss_rpc,
-                pan_window=(0, 0, sample_w, sample_h),
-            )
+            # 转换为 uint8 进行特征匹配
+            pan_uint8 = registrator._to_uint8(pan_sample)
+            mss_for_match = np.mean(mss_sample[:3], axis=0) if mss_sample.shape[0] >= 3 else mss_sample[0]
+            mss_uint8 = registrator._to_uint8(mss_for_match)
             
-            offset_info = reg_result.offset_info
+            # 特征点精配准
+            M, match_count, feat_offset = registrator._feature_refine(pan_uint8, mss_uint8)
             
-            # 将采样空间的偏移转换到原始空间
-            rpc_offset_orig = (
-                offset_info.rpc_offset[0] * sample_step_pan,
-                offset_info.rpc_offset[1] * sample_step_pan
-            )
-            feature_offset_orig = (
-                offset_info.feature_offset[0] * sample_step_pan,
-                offset_info.feature_offset[1] * sample_step_pan
-            )
+            feature_match_count = match_count
+            if M is not None:
+                # 将采样空间的偏移转换到原始空间
+                feature_offset_orig = (
+                    feat_offset[0] * sample_step_pan,
+                    feat_offset[1] * sample_step_pan
+                )
+                feature_refine_success = True
             
-            print(f"[粗配准] RPC 偏移: dx={rpc_offset_orig[0]:.2f}, dy={rpc_offset_orig[1]:.2f} (PAN 像素)")
-            print(f"[精配准] 特征点偏移: dx={feature_offset_orig[0]:.2f}, dy={feature_offset_orig[1]:.2f}, 匹配点: {offset_info.feature_match_count}")
-            
-            # 总偏移（在 PAN 像素空间）
-            total_offset_pan = (
-                rpc_offset_orig[0] + feature_offset_orig[0],
-                rpc_offset_orig[1] + feature_offset_orig[1]
-            )
+            print(f"[精配准] 特征点偏移: dx={feature_offset_orig[0]:.2f}, dy={feature_offset_orig[1]:.2f}, 匹配点: {feature_match_count}")
         else:
             print("[配准] 无 RPC，使用简单缩放")
-            total_offset_pan = (0.0, 0.0)
-            rpc_offset_orig = (0.0, 0.0)
-            feature_offset_orig = (0.0, 0.0)
+        
+        # 总偏移（在 PAN 像素空间）
+        total_offset_pan = (
+            rpc_offset_orig[0] + feature_offset_orig[0],
+            rpc_offset_orig[1] + feature_offset_orig[1]
+        )
         
         print(f"[总偏移] dx={total_offset_pan[0]:.2f}, dy={total_offset_pan[1]:.2f} (PAN 像素)")
         
         # ================================================================
-        # 计算全局权重
+        # 计算全局权重（使用采样数据）
         # ================================================================
         print("计算全局锐化权重...")
+        if 'pan_sample' not in dir():
+            # 如果没有 RPC，需要重新采样
+            sample_size = 2000
+            sample_step_pan = max(1, max(pan_w, pan_h) // sample_size)
+            pan_sample = pan_ds.read(1)[::sample_step_pan, ::sample_step_pan]
+            mss_sample_list = []
+            for b in range(num_bands):
+                mss_band = mss_ds.read(b + 1)
+                mss_resized = cv2.resize(mss_band, (pan_w, pan_h), interpolation=cv2.INTER_CUBIC)
+                mss_sample_list.append(mss_resized[::sample_step_pan, ::sample_step_pan])
+            mss_sample = np.stack(mss_sample_list, axis=0)
+        
         _, global_weights = calculate_band_correlations(pan_sample, [mss_sample[b] for b in range(num_bands)])
         print(f"权重: {global_weights}")
         
@@ -441,8 +471,8 @@ def fuse_scene(
             'registration': {
                 'rpc_offset_pan_px': list(rpc_offset_orig),
                 'feature_offset_pan_px': list(feature_offset_orig),
-                'feature_match_count': offset_info.feature_match_count if offset_info else 0,
-                'feature_refine_success': offset_info.feature_refine_success if offset_info else False,
+                'feature_match_count': feature_match_count,
+                'feature_refine_success': feature_refine_success,
                 'total_offset_pan_px': list(total_offset_pan),
             },
         }
