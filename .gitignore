@@ -1,1 +1,5 @@
 __pycache__/image_utils.cpython-313.pyc
+.kiro/
+.hypothesis/
+*__pycache__*
+pyproject.toml
