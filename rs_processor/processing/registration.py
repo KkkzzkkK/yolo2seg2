@@ -61,7 +61,7 @@ class RegistrationProcessor:
     
     实现两阶段配准：
     1. RPC 粗配准：使用 RPC 参数计算初始对齐（整体平移）
-    2. 特征点精配准：使用 ORB 进行精细化调整
+    2. 精配准：支持 ORB 特征点匹配或相位相关
     """
     
     def __init__(
@@ -69,17 +69,23 @@ class RegistrationProcessor:
         enable_feature_refine: bool = True,
         feature_max: int = 2000,
         feature_min_match: int = 10,
+        refine_method: Literal["orb", "phase", "both"] = "both",
     ):
         """初始化配准处理器
         
         Args:
-            enable_feature_refine: 是否启用特征点精配准
-            feature_max: 最大特征点数量
-            feature_min_match: 最小匹配点数量
+            enable_feature_refine: 是否启用精配准
+            feature_max: 最大特征点数量（ORB）
+            feature_min_match: 最小匹配点数量（ORB）
+            refine_method: 精配准方法
+                - "orb": 仅使用 ORB 特征点
+                - "phase": 仅使用相位相关
+                - "both": 先相位相关粗调，再 ORB 精调（默认）
         """
         self.enable_feature_refine = enable_feature_refine
         self.feature_max = feature_max
         self.feature_min_match = feature_min_match
+        self.refine_method = refine_method
     
     def _orb_refine(
         self,
@@ -144,6 +150,59 @@ class RegistrationProcessor:
         except Exception:
             return None, len(good_matches), (0.0, 0.0)
 
+    def _phase_correlation_refine(
+        self,
+        pan_data: np.ndarray,
+        mss_data: np.ndarray
+    ) -> Tuple[float, float, float]:
+        """使用相位相关计算亚像素级全局偏移
+        
+        相位相关利用 FFT 在频域计算两幅图像的平移偏移，
+        对所有像素都有贡献，比特征点匹配更稳定。
+        
+        Args:
+            pan_data: PAN 影像 (H, W)
+            mss_data: MSS 影像 (H, W)，需与 PAN 尺寸相同
+            
+        Returns:
+            (dx, dy, confidence): 偏移量和置信度
+            dx > 0 表示 MSS 需要向右移动才能对齐 PAN
+            dy > 0 表示 MSS 需要向下移动才能对齐 PAN
+        """
+        # 转换为 float64
+        pan_f64 = pan_data.astype(np.float64)
+        mss_f64 = mss_data.astype(np.float64)
+        
+        # 归一化到 [0, 1]
+        pan_min, pan_max = pan_f64.min(), pan_f64.max()
+        mss_min, mss_max = mss_f64.min(), mss_f64.max()
+        
+        if pan_max > pan_min:
+            pan_f64 = (pan_f64 - pan_min) / (pan_max - pan_min)
+        if mss_max > mss_min:
+            mss_f64 = (mss_f64 - mss_min) / (mss_max - mss_min)
+        
+        # 应用汉宁窗减少边缘效应
+        h, w = pan_f64.shape
+        hann_y = np.hanning(h)
+        hann_x = np.hanning(w)
+        hann_2d = np.outer(hann_y, hann_x)
+        
+        pan_windowed = pan_f64 * hann_2d
+        mss_windowed = mss_f64 * hann_2d
+        
+        # 使用 OpenCV 的相位相关（支持亚像素精度）
+        try:
+            shift, response = cv2.phaseCorrelate(mss_windowed, pan_windowed)
+            # shift 返回的是 (x, y)，表示 mss 相对于 pan 的偏移
+            # 正值表示 mss 在 pan 的右/下方
+            dx, dy = shift
+            confidence = response
+            return dx, dy, confidence
+        except Exception as e:
+            logger.warning(f"相位相关失败: {e}")
+            return 0.0, 0.0, 0.0
+
     def _to_uint8(self, data: np.ndarray) -> np.ndarray:
         """将影像数据转换为 uint8"""
         if data.dtype == np.uint8:
@@ -199,8 +258,10 @@ class RegistrationProcessor:
         transform_matrix = np.eye(3, dtype=np.float64)
         feature_match_count = 0
         feature_refine_success = False
+        phase_offset = (0.0, 0.0)
+        phase_confidence = 0.0
         
-        # 2. 特征点精配准（在采样数据上）
+        # 2. 精配准（在采样数据上）
         if self.enable_feature_refine:
             pan_uint8 = self._to_uint8(pan_sample)
             
@@ -214,17 +275,41 @@ class RegistrationProcessor:
             
             mss_uint8 = self._to_uint8(mss_for_match)
             
-            M, match_count, feat_offset = self._orb_refine(pan_uint8, mss_uint8)
-            
-            feature_match_count = match_count
-            
-            if M is not None:
-                transform_matrix = M
-                feature_offset = (
-                    feat_offset[0] * sample_step,
-                    feat_offset[1] * sample_step
+            # 相位相关（全局偏移，亚像素精度）
+            if self.refine_method in ("phase", "both"):
+                dx_phase, dy_phase, phase_confidence = self._phase_correlation_refine(
+                    pan_sample, mss_for_match
                 )
-                feature_refine_success = True
+                phase_offset = (dx_phase * sample_step, dy_phase * sample_step)
+                logger.info(f"相位相关偏移: dx={phase_offset[0]:.2f}, dy={phase_offset[1]:.2f}, 置信度={phase_confidence:.4f}")
+            
+            # ORB 特征点匹配
+            orb_offset = (0.0, 0.0)
+            if self.refine_method in ("orb", "both"):
+                M, match_count, feat_offset = self._orb_refine(pan_uint8, mss_uint8)
+                feature_match_count = match_count
+                
+                if M is not None:
+                    transform_matrix = M
+                    orb_offset = (
+                        feat_offset[0] * sample_step,
+                        feat_offset[1] * sample_step
+                    )
+                    feature_refine_success = True
+            
+            # 合并偏移结果
+            if self.refine_method == "phase":
+                feature_offset = phase_offset
+                feature_refine_success = phase_confidence > 0.1
+            elif self.refine_method == "orb":
+                feature_offset = orb_offset
+            else:  # both
+                # 优先使用相位相关（更稳定），ORB 作为验证
+                if phase_confidence > 0.1:
+                    feature_offset = phase_offset
+                    feature_refine_success = True
+                elif feature_refine_success:
+                    feature_offset = orb_offset
         
         return RegistrationOffset(
             rpc_offset=rpc_offset,

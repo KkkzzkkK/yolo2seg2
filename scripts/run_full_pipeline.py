@@ -45,6 +45,7 @@ TILE_SIZE = 4096                        # 分块大小（处理大图时分块�
 OVERLAP = 256                           # 分块重叠
 SHARPEN_METHOD = "gram_schmidt"         # 锐化方法
 REFINE_METHOD = "auto"                  # 精配准方法: auto, orb, arosics
+REGISTRATION_SAMPLE_SIZE = 8000         # 配准采样尺寸（越大越精确，但更慢）
 SAVE_FUSED_TIFF = True                  # 是否保存融合后的 TIFF
 SAVE_FUSED_PNG = True                   # 是否保存融合后的 PNG 预览
 
@@ -226,8 +227,8 @@ def fuse_scene(
         # ================================================================
         print("[配准] 采样并进行两阶段配准...")
         
-        # 采样参数 - 采样到约 2000x2000 大小
-        sample_size = 2000
+        # 采样参数 - 使用配置的采样尺寸
+        sample_size = REGISTRATION_SAMPLE_SIZE
         sample_step_pan = max(1, max(pan_w, pan_h) // sample_size)
         sample_step_mss = max(1, max(mss_w, mss_h) // sample_size)
         
@@ -255,6 +256,7 @@ def fuse_scene(
                 enable_feature_refine=True,
                 feature_max=2000,
                 feature_min_match=10,
+                refine_method="both",  # 使用相位相关 + ORB
             )
             
             # 在采样数据上做配准，但使用原始尺寸计算 RPC 偏移
