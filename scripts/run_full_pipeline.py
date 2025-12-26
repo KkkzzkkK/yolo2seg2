@@ -28,11 +28,9 @@ from rasterio.windows import Window
 
 from rs_processor.core.rpc_utils import RPCParams, parse_rpb_file, ground_to_image, image_to_ground
 from rs_processor.core.pan_sharpen import gram_schmidt_sharpen, calculate_band_correlations
-from rs_processor.core.normalize import clahe_normalize, bands_to_rgb_uint8
-from rs_processor.core.tiff_io import read_tiff, write_tiff, write_png
+from rs_processor.core.normalize import bands_to_rgb_uint8
 from rs_processor.processing.registration import RegistrationProcessor
 from rs_processor.processing.label_processor import LabelProcessor, Detection
-from rs_processor.processing.tile_processor import TileProcessor, TileInfo
 
 # ============================================================================
 # 用户配置区
@@ -172,14 +170,18 @@ def compute_square_crop(
 
 
 # ============================================================================
-# Step 1: 整图配准 + 锐化 + 保存
+# Step 1: 整图配准 + 锐化 + 保存（分块处理大图）
 # ============================================================================
 def fuse_scene(
     scene_name: str,
     scene_dir: str,
     output_dir: str,
 ) -> Optional[Dict]:
-    """融合单个场景的整图
+    """融合单个场景的整图（分块处理以节省内存）
+    
+    配准流程（使用 RegistrationProcessor）：
+    1. RPC 粗配准 - 计算全局偏移
+    2. 特征点精配准 - ORB/Arosics 匹配
     
     Returns:
         融合结果信息，包含输出路径和元数据
@@ -205,12 +207,6 @@ def fuse_scene(
     if mss_rpc:
         print(f"MSS RPC: 已加载")
     
-    # 初始化配准处理器
-    registrator = RegistrationProcessor(
-        enable_feature_refine=True,
-        refine_method=REFINE_METHOD,
-    )
-    
     fused_dir = os.path.join(output_dir, 'fused', scene_name)
     os.makedirs(fused_dir, exist_ok=True)
     
@@ -219,63 +215,209 @@ def fuse_scene(
         mss_w, mss_h = mss_ds.width, mss_ds.height
         num_bands = min(mss_ds.count, 4)
         
-        print(f"开始融合... (分块大小: {TILE_SIZE}, 重叠: {OVERLAP})")
+        # 计算 MSS 到 PAN 的缩放比例
+        scale_x = pan_w / mss_w
+        scale_y = pan_h / mss_h
+        print(f"缩放比例: x={scale_x:.4f}, y={scale_y:.4f}")
         
-        # 读取整个 PAN 和 MSS
-        pan_data = pan_ds.read(1)
-        mss_data = np.stack([mss_ds.read(b + 1) for b in range(num_bands)], axis=0)
+        # ================================================================
+        # 采样配准（使用 RegistrationProcessor）
+        # ================================================================
+        print("[配准] 采样并进行两阶段配准...")
         
-        # 配准 MSS 到 PAN
+        # 采样参数 - 采样到约 2000x2000 大小
+        sample_size = 2000
+        sample_step_pan = max(1, max(pan_w, pan_h) // sample_size)
+        
+        # 读取采样数据
+        pan_sample = pan_ds.read(1)[::sample_step_pan, ::sample_step_pan]
+        sample_h, sample_w = pan_sample.shape
+        
+        # 读取 MSS 采样并重采样到 PAN 采样大小
+        mss_sample_list = []
+        for b in range(num_bands):
+            mss_band = mss_ds.read(b + 1)
+            mss_resized = cv2.resize(mss_band, (pan_w, pan_h), interpolation=cv2.INTER_CUBIC)
+            mss_sample_list.append(mss_resized[::sample_step_pan, ::sample_step_pan])
+        mss_sample = np.stack(mss_sample_list, axis=0)
+        
+        # 使用 RegistrationProcessor 进行配准
+        offset_info = None
         if pan_rpc and mss_rpc:
-            print("执行 RPC 配准...")
-            reg_result = registrator.register(
-                pan_data=pan_data,
-                pan_rpc=pan_rpc,
-                mss_data=mss_data,
-                mss_rpc=mss_rpc,
-                pan_window=(0, 0, pan_w, pan_h),
+            registrator = RegistrationProcessor(
+                enable_feature_refine=True,
+                feature_max=2000,
+                feature_min_match=20,
+                refine_method=REFINE_METHOD,
             )
-            mss_aligned = reg_result.aligned_mss
-            print(f"配准完成: 特征点匹配 {reg_result.offset_info.feature_match_count}")
-        else:
-            print("无 RPC，使用简单重采样...")
-            mss_aligned = np.stack([
-                cv2.resize(mss_data[b], (pan_w, pan_h), interpolation=cv2.INTER_CUBIC)
-                for b in range(num_bands)
-            ], axis=0)
-        
-        # 全色锐化
-        print("执行 Gram-Schmidt 锐化...")
-        mss_bands = [mss_aligned[b] for b in range(mss_aligned.shape[0])]
-        _, weights = calculate_band_correlations(pan_data, mss_bands)
-        fused_bands = gram_schmidt_sharpen(pan_data, mss_bands, weights)
-        
-        # 堆叠为数组
-        fused_data = np.stack(fused_bands, axis=0)
-        
-        # 保存融合结果
-        if SAVE_FUSED_TIFF:
-            tiff_path = os.path.join(fused_dir, 'fused.tif')
-            print(f"保存 TIFF: {tiff_path}")
             
-            # 使用 PAN 的 profile
+            # 在采样数据上做配准
+            reg_result = registrator.register(
+                pan_data=pan_sample,
+                pan_rpc=pan_rpc,
+                mss_data=mss_sample,
+                mss_rpc=mss_rpc,
+                pan_window=(0, 0, sample_w, sample_h),
+            )
+            
+            offset_info = reg_result.offset_info
+            
+            # 将采样空间的偏移转换到原始空间
+            rpc_offset_orig = (
+                offset_info.rpc_offset[0] * sample_step_pan,
+                offset_info.rpc_offset[1] * sample_step_pan
+            )
+            feature_offset_orig = (
+                offset_info.feature_offset[0] * sample_step_pan,
+                offset_info.feature_offset[1] * sample_step_pan
+            )
+            
+            print(f"[粗配准] RPC 偏移: dx={rpc_offset_orig[0]:.2f}, dy={rpc_offset_orig[1]:.2f} (PAN 像素)")
+            print(f"[精配准] 特征点偏移: dx={feature_offset_orig[0]:.2f}, dy={feature_offset_orig[1]:.2f}, 匹配点: {offset_info.feature_match_count}")
+            
+            # 总偏移（在 PAN 像素空间）
+            total_offset_pan = (
+                rpc_offset_orig[0] + feature_offset_orig[0],
+                rpc_offset_orig[1] + feature_offset_orig[1]
+            )
+        else:
+            print("[配准] 无 RPC，使用简单缩放")
+            total_offset_pan = (0.0, 0.0)
+            rpc_offset_orig = (0.0, 0.0)
+            feature_offset_orig = (0.0, 0.0)
+        
+        print(f"[总偏移] dx={total_offset_pan[0]:.2f}, dy={total_offset_pan[1]:.2f} (PAN 像素)")
+        
+        # ================================================================
+        # 计算全局权重
+        # ================================================================
+        print("计算全局锐化权重...")
+        _, global_weights = calculate_band_correlations(pan_sample, [mss_sample[b] for b in range(num_bands)])
+        print(f"权重: {global_weights}")
+        
+        # ================================================================
+        # 分块处理
+        # ================================================================
+        tile_size = TILE_SIZE
+        overlap = OVERLAP
+        
+        n_cols = math.ceil(pan_w / (tile_size - overlap))
+        n_rows = math.ceil(pan_h / (tile_size - overlap))
+        total_tiles = n_cols * n_rows
+        
+        print(f"分块处理: {n_cols}x{n_rows} = {total_tiles} 块 (每块 {tile_size}x{tile_size})")
+        
+        # 创建输出 TIFF
+        tiff_path = os.path.join(fused_dir, 'fused.tif') if SAVE_FUSED_TIFF else None
+        
+        if tiff_path:
             profile = pan_ds.profile.copy()
             profile.update(
-                count=fused_data.shape[0],
-                dtype=fused_data.dtype,
+                count=num_bands,
+                dtype='float32',
+                tiled=True,
+                blockxsize=256,
+                blockysize=256,
             )
-            
-            with rasterio.open(tiff_path, 'w', **profile) as dst:
-                for b in range(fused_data.shape[0]):
-                    dst.write(fused_data[b], b + 1)
+            fused_ds = rasterio.open(tiff_path, 'w', **profile)
+        else:
+            fused_ds = None
         
+        # 分块处理
+        processed = 0
+        for row in range(n_rows):
+            for col in range(n_cols):
+                # 计算 PAN 分块范围
+                pan_x0 = col * (tile_size - overlap)
+                pan_y0 = row * (tile_size - overlap)
+                pan_x1 = min(pan_x0 + tile_size, pan_w)
+                pan_y1 = min(pan_y0 + tile_size, pan_h)
+                
+                tile_w = pan_x1 - pan_x0
+                tile_h = pan_y1 - pan_y0
+                
+                if tile_w <= 0 or tile_h <= 0:
+                    continue
+                
+                # 读取 PAN 分块
+                pan_window = Window(pan_x0, pan_y0, tile_w, tile_h)
+                pan_tile = pan_ds.read(1, window=pan_window)
+                
+                # 计算对应的 MSS 范围（应用总偏移）
+                # 偏移是 MSS 相对于 PAN 的位移，所以 MSS 窗口要减去偏移
+                mss_x0 = int((pan_x0 - total_offset_pan[0]) / scale_x)
+                mss_y0 = int((pan_y0 - total_offset_pan[1]) / scale_y)
+                mss_x1 = int((pan_x1 - total_offset_pan[0]) / scale_x) + 1
+                mss_y1 = int((pan_y1 - total_offset_pan[1]) / scale_y) + 1
+                
+                # 裁剪到有效范围
+                mss_x0 = max(0, mss_x0)
+                mss_y0 = max(0, mss_y0)
+                mss_x1 = min(mss_w, mss_x1)
+                mss_y1 = min(mss_h, mss_y1)
+                
+                if mss_x1 <= mss_x0 or mss_y1 <= mss_y0:
+                    # MSS 窗口无效，用零填充
+                    mss_aligned = np.zeros((num_bands, tile_h, tile_w), dtype=np.float32)
+                else:
+                    # 读取 MSS 分块
+                    mss_window = Window(mss_x0, mss_y0, mss_x1 - mss_x0, mss_y1 - mss_y0)
+                    mss_tile = np.stack([
+                        mss_ds.read(b + 1, window=mss_window)
+                        for b in range(num_bands)
+                    ], axis=0)
+                    
+                    # 重采样 MSS 到 PAN 分辨率
+                    mss_aligned = np.stack([
+                        cv2.resize(mss_tile[b], (tile_w, tile_h), interpolation=cv2.INTER_CUBIC)
+                        for b in range(num_bands)
+                    ], axis=0)
+                
+                # 全色锐化（使用全局权重）
+                mss_bands = [mss_aligned[b] for b in range(num_bands)]
+                fused_bands = gram_schmidt_sharpen(pan_tile, mss_bands, global_weights)
+                
+                # 写入输出
+                if fused_ds:
+                    for b, band in enumerate(fused_bands):
+                        fused_ds.write(band.astype(np.float32), b + 1, window=pan_window)
+                
+                processed += 1
+                if processed % 10 == 0 or processed == total_tiles:
+                    print(f"  进度: {processed}/{total_tiles} ({100*processed/total_tiles:.1f}%)")
+        
+        if fused_ds:
+            fused_ds.close()
+            print(f"保存 TIFF: {tiff_path}")
+        
+        # 生成 PNG 预览（降采样）
         if SAVE_FUSED_PNG:
             png_path = os.path.join(fused_dir, 'fused_preview.png')
-            print(f"保存 PNG 预览: {png_path}")
-            rgb = bands_to_rgb_uint8(fused_data, method=PREVIEW_METHOD)
+            print(f"生成 PNG 预览...")
+            
+            # 降采样读取
+            preview_max_size = 4096
+            preview_scale = min(1.0, preview_max_size / max(pan_w, pan_h))
+            preview_w = int(pan_w * preview_scale)
+            preview_h = int(pan_h * preview_scale)
+            
+            if tiff_path and os.path.exists(tiff_path):
+                with rasterio.open(tiff_path) as src:
+                    preview_data = src.read(
+                        out_shape=(num_bands, preview_h, preview_w),
+                        resampling=rasterio.enums.Resampling.bilinear
+                    )
+            else:
+                preview_data = np.stack([
+                    cv2.resize(pan_ds.read(1), (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+                    for _ in range(num_bands)
+                ], axis=0)
+            
+            rgb = bands_to_rgb_uint8(preview_data, method=PREVIEW_METHOD)
             Image.fromarray(rgb).save(png_path)
+            print(f"保存 PNG 预览: {png_path}")
         
-        # 保存融合元数据
+        # 保存融合元数据（包含配准信息）
         metadata = {
             'scene': scene_name,
             'pan_path': pan_info['path'],
@@ -283,15 +425,31 @@ def fuse_scene(
             'pan_size': [pan_w, pan_h],
             'mss_size': [mss_w, mss_h],
             'fused_size': [pan_w, pan_h],
-            'num_bands': fused_data.shape[0],
+            'fused_tiff': tiff_path,
+            'num_bands': num_bands,
             'has_pan_rpc': pan_rpc is not None,
             'has_mss_rpc': mss_rpc is not None,
             'sharpen_method': SHARPEN_METHOD,
             'refine_method': REFINE_METHOD,
+            'tile_size': tile_size,
+            'overlap': overlap,
+            'global_weights': global_weights.tolist(),
+            'scale_x': scale_x,
+            'scale_y': scale_y,
+            # 配准偏移信息
+            'registration': {
+                'rpc_offset_pan_px': list(rpc_offset_orig),
+                'feature_offset_pan_px': list(feature_offset_orig),
+                'feature_match_count': offset_info.feature_match_count if offset_info else 0,
+                'feature_refine_success': offset_info.feature_refine_success if offset_info else False,
+                'total_offset_pan_px': list(total_offset_pan),
+            },
         }
         
         if pan_rpc:
             metadata['pan_rpc_path'] = pan_info['rpb_path']
+        if mss_rpc:
+            metadata['mss_rpc_path'] = mss_info['rpb_path']
         
         meta_path = os.path.join(fused_dir, 'fusion_metadata.json')
         with open(meta_path, 'w', encoding='utf-8') as f:
@@ -300,7 +458,7 @@ def fuse_scene(
         print(f"融合完成！输出: {fused_dir}")
         
         return {
-            'fused_data': fused_data,
+            'fused_tiff': tiff_path,
             'fused_dir': fused_dir,
             'metadata': metadata,
             'pan_rpc': pan_rpc,
@@ -313,7 +471,7 @@ def fuse_scene(
 def crop_detections(
     scene_name: str,
     label_path: str,
-    fused_data: np.ndarray,
+    fused_tiff: str,
     fused_dir: str,
     fusion_metadata: Dict,
     pan_rpc: Optional[RPCParams],
@@ -324,7 +482,7 @@ def crop_detections(
     Args:
         scene_name: 场景名称
         label_path: 标签文件路径
-        fused_data: 融合后的图像数据 (bands, H, W)
+        fused_tiff: 融合后的 TIFF 文件路径
         fused_dir: 融合输出目录
         fusion_metadata: 融合元数据
         pan_rpc: PAN 的 RPC 参数
@@ -345,91 +503,99 @@ def crop_detections(
     
     print(f"检测框数量: {len(detections)}")
     
-    _, img_h, img_w = fused_data.shape
-    h_avg = pan_rpc.height_offset if pan_rpc else 0
+    # 打开融合后的 TIFF
+    if not fused_tiff or not os.path.exists(fused_tiff):
+        print(f"[error] 融合 TIFF 不存在: {fused_tiff}")
+        return []
     
     crops_dir = os.path.join(output_dir, 'crops', scene_name)
     os.makedirs(crops_dir, exist_ok=True)
     
     results = []
     
-    for det_idx, det in enumerate(detections[:MAX_DETECTIONS]):
-        try:
-            # 归一化坐标 -> 像素坐标（相对于融合图，即 PAN 尺寸）
-            points_px = [
-                (det.points[i] * img_w, det.points[i+1] * img_h)
-                for i in range(0, 8, 2)
-            ]
-            
-            # 计算检测框边界和中心
-            xs = [p[0] for p in points_px]
-            ys = [p[1] for p in points_px]
-            cx = sum(xs) / len(xs)
-            cy = sum(ys) / len(ys)
-            det_w = max(xs) - min(xs)
-            det_h = max(ys) - min(ys)
-            
-            # 计算裁剪窗口
-            crop_x, crop_y, crop_w, crop_h = compute_square_crop(
-                cx, cy, det_w, det_h, BOX_SCALE,
-                img_w, img_h, CROP_MULTIPLE, MIN_CROP_SIZE
-            )
-            
-            if crop_w <= 0 or crop_h <= 0:
-                print(f"[{det_idx}] 裁剪区域无效，跳过")
-                continue
-            
-            # 裁剪
-            crop_data = fused_data[:, crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-            
-            # 转换为 RGB 并保存
-            rgb = bands_to_rgb_uint8(crop_data, method=PREVIEW_METHOD)
-            
-            crop_path = os.path.join(crops_dir, f"det_{det_idx:03d}.png")
-            Image.fromarray(rgb).save(crop_path)
-            
-            # 计算检测框在裁剪图中的相对位置
-            rel_points = [
-                ((x - crop_x) / crop_w, (y - crop_y) / crop_h)
-                for x, y in points_px
-            ]
-            
-            # 计算经纬度（如果有 RPC）
-            geo_points = []
-            if pan_rpc:
-                for x, y in points_px:
-                    lon, lat = image_to_ground(x, y, pan_rpc, h_avg)
-                    geo_points.append([lon, lat])
-            
-            # 保存元数据
-            crop_metadata = {
-                'det_idx': det_idx,
-                'class_id': det.class_id,
-                'score': det.score,
-                'global_offset_x': crop_x,
-                'global_offset_y': crop_y,
-                'crop_width': crop_w,
-                'crop_height': crop_h,
-                'fused_size': [img_w, img_h],
-                'original_poly_norm': [
-                    [det.points[i], det.points[i+1]]
+    with rasterio.open(fused_tiff) as fused_ds:
+        img_w, img_h = fused_ds.width, fused_ds.height
+        num_bands = fused_ds.count
+        h_avg = pan_rpc.height_offset if pan_rpc else 0
+        
+        for det_idx, det in enumerate(detections[:MAX_DETECTIONS]):
+            try:
+                # 归一化坐标 -> 像素坐标（相对于融合图，即 PAN 尺寸）
+                points_px = [
+                    (det.points[i] * img_w, det.points[i+1] * img_h)
                     for i in range(0, 8, 2)
-                ],
-                'poly_in_crop_norm': rel_points,
-                'geo_polygon': geo_points if geo_points else None,
-                'fusion_metadata_path': os.path.join(fused_dir, 'fusion_metadata.json'),
-            }
-            
-            meta_path = os.path.join(crops_dir, f"det_{det_idx:03d}_metadata.json")
-            with open(meta_path, 'w', encoding='utf-8') as f:
-                json.dump(crop_metadata, f, ensure_ascii=False, indent=2)
-            
-            print(f"[{det_idx}] 保存: {crop_path} ({crop_w}x{crop_h})")
-            results.append({'det_idx': det_idx, 'success': True, 'path': crop_path})
-            
-        except Exception as e:
-            print(f"[{det_idx}] 错误: {e}")
-            results.append({'det_idx': det_idx, 'success': False, 'error': str(e)})
+                ]
+                
+                # 计算检测框边界和中心
+                xs = [p[0] for p in points_px]
+                ys = [p[1] for p in points_px]
+                cx = sum(xs) / len(xs)
+                cy = sum(ys) / len(ys)
+                det_w = max(xs) - min(xs)
+                det_h = max(ys) - min(ys)
+                
+                # 计算裁剪窗口
+                crop_x, crop_y, crop_w, crop_h = compute_square_crop(
+                    cx, cy, det_w, det_h, BOX_SCALE,
+                    img_w, img_h, CROP_MULTIPLE, MIN_CROP_SIZE
+                )
+                
+                if crop_w <= 0 or crop_h <= 0:
+                    print(f"[{det_idx}] 裁剪区域无效，跳过")
+                    continue
+                
+                # 从 TIFF 读取裁剪区域
+                crop_window = Window(crop_x, crop_y, crop_w, crop_h)
+                crop_data = fused_ds.read(window=crop_window)
+                
+                # 转换为 RGB 并保存
+                rgb = bands_to_rgb_uint8(crop_data, method=PREVIEW_METHOD)
+                
+                crop_path = os.path.join(crops_dir, f"det_{det_idx:03d}.png")
+                Image.fromarray(rgb).save(crop_path)
+                
+                # 计算检测框在裁剪图中的相对位置
+                rel_points = [
+                    ((x - crop_x) / crop_w, (y - crop_y) / crop_h)
+                    for x, y in points_px
+                ]
+                
+                # 计算经纬度（如果有 RPC）
+                geo_points = []
+                if pan_rpc:
+                    for x, y in points_px:
+                        lon, lat = image_to_ground(x, y, pan_rpc, h_avg)
+                        geo_points.append([lon, lat])
+                
+                # 保存元数据
+                crop_metadata = {
+                    'det_idx': det_idx,
+                    'class_id': det.class_id,
+                    'score': det.score,
+                    'global_offset_x': crop_x,
+                    'global_offset_y': crop_y,
+                    'crop_width': crop_w,
+                    'crop_height': crop_h,
+                    'fused_size': [img_w, img_h],
+                    'original_poly_norm': [
+                        [det.points[i], det.points[i+1]]
+                        for i in range(0, 8, 2)
+                    ],
+                    'poly_in_crop_norm': rel_points,
+                    'geo_polygon': geo_points if geo_points else None,
+                    'fusion_metadata_path': os.path.join(fused_dir, 'fusion_metadata.json'),
+                }
+                
+                meta_path = os.path.join(crops_dir, f"det_{det_idx:03d}_metadata.json")
+                with open(meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(crop_metadata, f, ensure_ascii=False, indent=2)
+                
+                print(f"[{det_idx}] 保存: {crop_path} ({crop_w}x{crop_h})")
+                results.append({'det_idx': det_idx, 'success': True, 'path': crop_path})
+                
+            except Exception as e:
+                print(f"[{det_idx}] 错误: {e}")
+                results.append({'det_idx': det_idx, 'success': False, 'error': str(e)})
     
     # 保存汇总元数据
     summary_path = os.path.join(crops_dir, 'crops_summary.json')
@@ -469,7 +635,7 @@ def process_scene(
     crop_results = crop_detections(
         scene_name=scene_name,
         label_path=label_path,
-        fused_data=fuse_result['fused_data'],
+        fused_tiff=fuse_result['fused_tiff'],
         fused_dir=fuse_result['fused_dir'],
         fusion_metadata=fuse_result['metadata'],
         pan_rpc=fuse_result['pan_rpc'],
