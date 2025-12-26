@@ -37,14 +37,14 @@ class RegistrationOffset:
         )
     
     def to_dict(self) -> dict:
-        """转换为字典"""
+        """转换为字典（确保 JSON 可序列化）"""
         return {
-            'rpc_offset': list(self.rpc_offset),
-            'feature_offset': list(self.feature_offset),
-            'total_offset': list(self.total_offset),
+            'rpc_offset': [float(x) for x in self.rpc_offset],
+            'feature_offset': [float(x) for x in self.feature_offset],
+            'total_offset': [float(x) for x in self.total_offset],
             'transform_matrix': self.transform_matrix.tolist() if self.transform_matrix is not None else None,
-            'feature_match_count': self.feature_match_count,
-            'feature_refine_success': self.feature_refine_success,
+            'feature_match_count': int(self.feature_match_count),
+            'feature_refine_success': bool(self.feature_refine_success),
         }
 
 
