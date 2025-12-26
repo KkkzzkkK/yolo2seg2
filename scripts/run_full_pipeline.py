@@ -431,16 +431,16 @@ def fuse_scene(
             'refine_method': REFINE_METHOD,
             'tile_size': tile_size,
             'overlap': overlap,
-            'global_weights': global_weights.tolist(),
-            'scale_x': scale_x,
-            'scale_y': scale_y,
+            'global_weights': [float(w) for w in global_weights],
+            'scale_x': float(scale_x),
+            'scale_y': float(scale_y),
             # 配准偏移信息
             'registration': {
-                'rpc_offset_pan_px': list(rpc_offset_orig),
-                'feature_offset_pan_px': list(feature_offset_orig),
-                'feature_match_count': feature_match_count,
-                'feature_refine_success': feature_refine_success,
-                'total_offset_pan_px': list(total_offset_pan),
+                'rpc_offset_pan_px': [float(x) for x in rpc_offset_orig],
+                'feature_offset_pan_px': [float(x) for x in feature_offset_orig],
+                'feature_match_count': int(feature_match_count),
+                'feature_refine_success': bool(feature_refine_success),
+                'total_offset_pan_px': [float(x) for x in total_offset_pan],
             },
         }
         
