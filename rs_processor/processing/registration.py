@@ -113,6 +113,7 @@ class RegistrationProcessor:
         """RPC 粗配准
         
         使用 RPC 参数计算 MSS 到 PAN 的初始对齐。
+        对于同源 PAN/MSS（如 GF1B、GF2），偏移通常很小（几个像素）。
         
         Args:
             pan_data: PAN 影像数据 (H, W)
@@ -124,64 +125,46 @@ class RegistrationProcessor:
         Returns:
             aligned_mss: 对齐后的 MSS 数据 (bands, H, W)
             valid_mask: 有效区域掩膜 (H, W)
-            rpc_offset: RPC 偏移量 (dx, dy)
+            rpc_offset: RPC 偏移量 (dx, dy) - 以 PAN 像素为单位
         """
         col_off, row_off, pan_width, pan_height = pan_window
-        
-        # 计算 PAN 窗口中心的地理坐标
-        center_col = col_off + pan_width / 2
-        center_row = row_off + pan_height / 2
-        
-        # 使用 RPC 中心作为参考高程
-        height = pan_rpc.height_offset
-        
-        # 计算 PAN 中心对应的地理坐标（使用 RPC 中心近似）
-        lon = pan_rpc.long_offset
-        lat = pan_rpc.lat_offset
-        
-        # 计算该地理坐标在 MSS 中的像素位置
-        mss_col, mss_row = ground_to_image(lon, lat, height, mss_rpc)
-        pan_col, pan_row = ground_to_image(lon, lat, height, pan_rpc)
+        mss_bands, mss_height, mss_width = mss_data.shape
         
         # 计算 MSS 到 PAN 的缩放比例
-        mss_bands, mss_height, mss_width = mss_data.shape
         scale_x = pan_data.shape[1] / mss_width if mss_width > 0 else 1.0
         scale_y = pan_data.shape[0] / mss_height if mss_height > 0 else 1.0
         
-        # 计算偏移量（在 PAN 像素空间）
-        dx = mss_col * scale_x - pan_col
-        dy = mss_row * scale_y - pan_row
+        # 使用 RPC 中心点作为参考地标
+        lon = pan_rpc.long_offset
+        lat = pan_rpc.lat_offset
+        h = pan_rpc.height_offset
+        
+        # 将地标投影到 PAN 和 MSS 影像
+        pan_col, pan_row = ground_to_image(lon, lat, h, pan_rpc)
+        mss_col, mss_row = ground_to_image(lon, lat, h, mss_rpc)
+        
+        # 将 MSS 坐标缩放到 PAN 像素空间
+        mss_col_in_pan = mss_col * scale_x
+        mss_row_in_pan = mss_row * scale_y
+        
+        # 计算偏移量（以 PAN 像素为单位）
+        # 正值表示 MSS 内容相对 PAN 向右/下偏移
+        dx = mss_col_in_pan - pan_col
+        dy = mss_row_in_pan - pan_row
         
         # 创建输出数组
         aligned_mss = np.zeros((mss_bands, pan_height, pan_width), dtype=mss_data.dtype)
         valid_mask = np.zeros((pan_height, pan_width), dtype=np.uint8)
         
-        # 对每个波段进行重采样
+        # 对每个波段进行重采样（简单缩放，不应用偏移，偏移在后续分块处理中应用）
         for b in range(mss_bands):
-            # 计算 MSS 中对应的窗口
-            mss_col_start = int((col_off + dx) / scale_x)
-            mss_row_start = int((row_off + dy) / scale_y)
-            mss_col_end = int((col_off + pan_width + dx) / scale_x)
-            mss_row_end = int((row_off + pan_height + dy) / scale_y)
-            
-            # 裁剪到有效范围
-            mss_col_start = max(0, mss_col_start)
-            mss_row_start = max(0, mss_row_start)
-            mss_col_end = min(mss_width, mss_col_end)
-            mss_row_end = min(mss_height, mss_row_end)
-            
-            if mss_col_end > mss_col_start and mss_row_end > mss_row_start:
-                # 提取 MSS 窗口
-                mss_window = mss_data[b, mss_row_start:mss_row_end, mss_col_start:mss_col_end]
-                
-                # 重采样到 PAN 分辨率
-                resampled = cv2.resize(
-                    mss_window.astype(np.float32),
-                    (pan_width, pan_height),
-                    interpolation=cv2.INTER_CUBIC
-                )
-                
-                aligned_mss[b] = resampled.astype(mss_data.dtype)
+            # 直接重采样到 PAN 分辨率
+            resampled = cv2.resize(
+                mss_data[b].astype(np.float32),
+                (pan_width, pan_height),
+                interpolation=cv2.INTER_CUBIC
+            )
+            aligned_mss[b] = resampled.astype(mss_data.dtype)
         
         # 设置有效区域掩膜
         valid_mask[:] = 255
@@ -238,30 +221,34 @@ class RegistrationProcessor:
         try:
             import tempfile
             import os
+            import warnings
             
             # Arosics 需要文件路径，创建临时文件
             with tempfile.TemporaryDirectory() as tmpdir:
                 ref_path = os.path.join(tmpdir, 'ref.tif')
                 tgt_path = os.path.join(tmpdir, 'tgt.tif')
                 
-                # 保存为临时 TIFF
+                # 保存为临时 TIFF（使用虚拟坐标，仅用于像素级配准）
                 import rasterio
-                from rasterio.transform import from_bounds
+                from rasterio.transform import Affine
                 
                 h, w = pan_uint8.shape
-                transform = from_bounds(0, 0, w, h, w, h)
+                # 使用非单位变换避免警告（1像素=1米的虚拟坐标）
+                transform = Affine(1.0, 0.0, 0.0, 0.0, -1.0, h)
                 
                 for path, data in [(ref_path, pan_uint8), (tgt_path, mss_uint8)]:
-                    with rasterio.open(
-                        path, 'w',
-                        driver='GTiff',
-                        height=data.shape[0],
-                        width=data.shape[1],
-                        count=1,
-                        dtype=data.dtype,
-                        transform=transform,
-                    ) as dst:
-                        dst.write(data, 1)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', category=rasterio.errors.NotGeoreferencedWarning)
+                        with rasterio.open(
+                            path, 'w',
+                            driver='GTiff',
+                            height=data.shape[0],
+                            width=data.shape[1],
+                            count=1,
+                            dtype=data.dtype,
+                            transform=transform,
+                        ) as dst:
+                            dst.write(data, 1)
                 
                 # 使用 Arosics COREG 进行配准
                 CR = COREG(

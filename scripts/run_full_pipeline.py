@@ -35,9 +35,10 @@ from rs_processor.processing.label_processor import LabelProcessor, Detection
 # ============================================================================
 # 用户配置区
 # ============================================================================
-INPUT_DIR = r"F:\code\pic"              # 影像根目录（每个场景一个子文件夹）
-LABEL_DIR = r"F:\labels_export"         # YOLO 标签目录
-OUTPUT_DIR = r"F:\output"               # 输出根目录
+INPUT_DIR = r"F:\code\pic\pt"              # 影像根目录（每个场景一个子文件夹）
+LABEL_DIR = r"F:\1218\labels_export"         # YOLO 标签目录
+OUTPUT_DIR = r"F:\1218\output"                   # 输出根目录
+
 
 # 融合参数
 TILE_SIZE = 4096                        # 分块大小（处理大图时分块）
@@ -413,7 +414,7 @@ def fuse_scene(
                     for _ in range(num_bands)
                 ], axis=0)
             
-            rgb = bands_to_rgb_uint8(preview_data, method=PREVIEW_METHOD)
+            rgb = bands_to_rgb_uint8(preview_data)
             Image.fromarray(rgb).save(png_path)
             print(f"保存 PNG 预览: {png_path}")
         
@@ -549,7 +550,7 @@ def crop_detections(
                 crop_data = fused_ds.read(window=crop_window)
                 
                 # 转换为 RGB 并保存
-                rgb = bands_to_rgb_uint8(crop_data, method=PREVIEW_METHOD)
+                rgb = bands_to_rgb_uint8(crop_data)
                 
                 crop_path = os.path.join(crops_dir, f"det_{det_idx:03d}.png")
                 Image.fromarray(rgb).save(crop_path)
