@@ -519,9 +519,10 @@ def crop_detections(
         for det_idx, det in enumerate(detections[:MAX_DETECTIONS]):
             try:
                 # 归一化坐标 -> 像素坐标（相对于融合图，即 PAN 尺寸）
+                # Detection.polygon_norm 是 [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]
                 points_px = [
-                    (det.points[i] * img_w, det.points[i+1] * img_h)
-                    for i in range(0, 8, 2)
+                    (x * img_w, y * img_h)
+                    for x, y in det.polygon_norm
                 ]
                 
                 # 计算检测框边界和中心
@@ -576,8 +577,8 @@ def crop_detections(
                     'crop_height': int(crop_h),
                     'fused_size': [int(img_w), int(img_h)],
                     'original_poly_norm': [
-                        [float(det.points[i]), float(det.points[i+1])]
-                        for i in range(0, 8, 2)
+                        [float(x), float(y)]
+                        for x, y in det.polygon_norm
                     ],
                     'poly_in_crop_norm': rel_points,
                     'geo_polygon': geo_points if geo_points else None,
