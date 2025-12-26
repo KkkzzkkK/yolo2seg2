@@ -48,6 +48,14 @@ class RegistrationOffset:
         }
 
 
+@dataclass
+class RegistrationResult:
+    """配准结果"""
+    aligned_mss: np.ndarray          # 配准后的 MSS 数据 (bands, H, W)
+    valid_mask: np.ndarray           # 有效区域掩膜 (H, W)
+    offset_info: RegistrationOffset  # 配准偏移信息
+
+
 class RegistrationProcessor:
     """影像配准处理器
     
