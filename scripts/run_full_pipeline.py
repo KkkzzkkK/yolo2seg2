@@ -44,10 +44,13 @@ OUTPUT_DIR = r"F:\1218\output"                   # 输出根目录
 TILE_SIZE = 4096                        # 分块大小（处理大图时分块）
 OVERLAP = 256                           # 分块重叠
 SHARPEN_METHOD = "gram_schmidt"         # 锐化方法
-REFINE_METHOD = "auto"                  # 精配准方法: auto, orb, arosics
 REGISTRATION_SAMPLE_SIZE = 8000         # 配准采样尺寸（越大越精确，但更慢）
 SAVE_FUSED_TIFF = True                  # 是否保存融合后的 TIFF
 SAVE_FUSED_PNG = True                   # 是否保存融合后的 PNG 预览
+
+# 配准参数
+ENABLE_RPC_COARSE = False               # 是否启用 RPC 粗配准（同源数据建议关闭）
+REFINE_METHOD = "phase"                 # 精配准方法: "phase"(相位相关), "orb"(特征点), "both"(两者结合), "none"(不配准)
 
 # 裁剪参数
 BOX_SCALE = 1.3                         # 检测框放大倍数
@@ -251,15 +254,16 @@ def fuse_scene(
         feature_match_count = 0
         feature_refine_success = False
         
-        if pan_rpc and mss_rpc:
+        # 根据配置决定是否进行配准
+        if REFINE_METHOD != "none" and pan_rpc and mss_rpc:
             registrator = RegistrationProcessor(
-                enable_feature_refine=True,
+                enable_feature_refine=(REFINE_METHOD != "none"),
                 feature_max=2000,
                 feature_min_match=10,
-                refine_method="both",  # 使用相位相关 + ORB
+                refine_method=REFINE_METHOD if REFINE_METHOD != "none" else "phase",
             )
             
-            # 在采样数据上做配准，但使用原始尺寸计算 RPC 偏移
+            # 在采样数据上做配准
             offset_info = registrator.register_sampled(
                 pan_sample=pan_sample,
                 mss_sample=mss_sample,
@@ -268,6 +272,7 @@ def fuse_scene(
                 pan_full_size=(pan_w, pan_h),
                 mss_full_size=(mss_w, mss_h),
                 sample_step=sample_step_pan,
+                enable_rpc_coarse=ENABLE_RPC_COARSE,  # 是否启用 RPC 粗配准
             )
             
             rpc_offset_orig = offset_info.rpc_offset
@@ -275,8 +280,11 @@ def fuse_scene(
             feature_match_count = offset_info.feature_match_count
             feature_refine_success = offset_info.feature_refine_success
             
-            print(f"[粗配准] RPC 偏移: dx={rpc_offset_orig[0]:.2f}, dy={rpc_offset_orig[1]:.2f} (PAN 像素)")
-            print(f"[精配准] 特征点偏移: dx={feature_offset_orig[0]:.2f}, dy={feature_offset_orig[1]:.2f}, 匹配点: {feature_match_count}")
+            if ENABLE_RPC_COARSE:
+                print(f"[粗配准] RPC 偏移: dx={rpc_offset_orig[0]:.2f}, dy={rpc_offset_orig[1]:.2f} (PAN 像素)")
+            print(f"[精配准] 偏移: dx={feature_offset_orig[0]:.2f}, dy={feature_offset_orig[1]:.2f}, 方法: {REFINE_METHOD}, 匹配点: {feature_match_count}")
+        elif REFINE_METHOD == "none":
+            print("[配准] 已禁用配准")
         else:
             print("[配准] 无 RPC，使用简单缩放")
         

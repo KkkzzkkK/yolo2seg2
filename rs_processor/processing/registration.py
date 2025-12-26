@@ -227,12 +227,13 @@ class RegistrationProcessor:
         pan_full_size: Tuple[int, int],
         mss_full_size: Tuple[int, int],
         sample_step: int = 1,
+        enable_rpc_coarse: bool = False,
     ) -> RegistrationOffset:
-        """在采样数据上执行两阶段配准
+        """在采样数据上执行配准
         
         专为大图设计：
-        1. RPC 粗配准使用原始尺寸计算偏移
-        2. 特征点精配准在采样数据上进行，然后缩放回原始空间
+        1. RPC 粗配准（可选）：使用原始尺寸计算偏移
+        2. 精配准：相位相关和/或 ORB 特征点
         
         Args:
             pan_sample: PAN 采样数据 (H, W)
@@ -242,16 +243,20 @@ class RegistrationProcessor:
             pan_full_size: PAN 原始尺寸 (width, height)
             mss_full_size: MSS 原始尺寸 (width, height)
             sample_step: 采样步长（用于将特征偏移缩放回原始空间）
+            enable_rpc_coarse: 是否启用 RPC 粗配准（同源 PAN/MSS 建议关闭）
             
         Returns:
             RegistrationOffset: 配准偏移信息（在原始 PAN 像素空间）
         """
-        # 1. RPC 粗配准（使用原始尺寸）
-        rpc_offset = estimate_offset_from_rpcs(
-            pan_rpc, mss_rpc,
-            pan_size=pan_full_size,
-            mss_size=mss_full_size
-        )
+        # 1. RPC 粗配准（可选）
+        if enable_rpc_coarse:
+            rpc_offset = estimate_offset_from_rpcs(
+                pan_rpc, mss_rpc,
+                pan_size=pan_full_size,
+                mss_size=mss_full_size
+            )
+        else:
+            rpc_offset = (0.0, 0.0)
         
         # 初始化
         feature_offset = (0.0, 0.0)
