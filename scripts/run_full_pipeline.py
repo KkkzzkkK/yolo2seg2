@@ -177,6 +177,85 @@ def compute_square_crop(
 # ============================================================================
 # Step 1: 整图配准 + 锐化 + 保存（分块处理大图）
 # ============================================================================
+def warp_mss_to_pan_size(
+    mss_ds,
+    pan_w: int,
+    pan_h: int,
+    num_bands: int,
+    total_offset_pan: Tuple[float, float],
+    scale_x: float,
+    scale_y: float,
+    output_path: str,
+) -> str:
+    """将 MSS 全局 warp 到 PAN 尺寸，生成临时文件
+    
+    使用 cv2.warpAffine 一次性完成缩放和平移，避免分块边界不连续。
+    
+    Args:
+        mss_ds: MSS rasterio 数据集
+        pan_w, pan_h: PAN 尺寸
+        num_bands: 波段数
+        total_offset_pan: 总偏移 (dx, dy)，在 PAN 像素空间
+        scale_x, scale_y: MSS 到 PAN 的缩放比例
+        output_path: 输出临时文件路径
+        
+    Returns:
+        输出文件路径
+    """
+    mss_w, mss_h = mss_ds.width, mss_ds.height
+    
+    # 构建仿射变换矩阵：先缩放，再平移
+    # 目标坐标 = M @ 源坐标
+    # pan_x = mss_x * scale_x + offset_x
+    # 所以 mss_x = (pan_x - offset_x) / scale_x
+    # 但 warpAffine 是从目标到源的映射，所以需要逆变换
+    # 我们需要的是：对于 PAN 空间的每个点 (px, py)，找到 MSS 空间的对应点
+    # mss_x = (px - total_offset_pan[0]) / scale_x
+    # mss_y = (py - total_offset_pan[1]) / scale_y
+    
+    # warpAffine 的 M 矩阵定义：dst(x,y) = src(M[0,0]*x + M[0,1]*y + M[0,2], M[1,0]*x + M[1,1]*y + M[1,2])
+    # 所以 M = [[1/scale_x, 0, -offset_x/scale_x], [0, 1/scale_y, -offset_y/scale_y]]
+    M = np.array([
+        [1.0 / scale_x, 0, -total_offset_pan[0] / scale_x],
+        [0, 1.0 / scale_y, -total_offset_pan[1] / scale_y]
+    ], dtype=np.float64)
+    
+    # 创建输出文件
+    profile = {
+        'driver': 'GTiff',
+        'width': pan_w,
+        'height': pan_h,
+        'count': num_bands,
+        'dtype': 'float32',
+        'tiled': True,
+        'blockxsize': 256,
+        'blockysize': 256,
+        'compress': 'lzw',
+    }
+    
+    print(f"[warp] 生成配准后的 MSS: {pan_w}x{pan_h}, {num_bands} 波段")
+    
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        for b in range(num_bands):
+            print(f"  波段 {b+1}/{num_bands}...")
+            # 读取整个波段
+            mss_band = mss_ds.read(b + 1).astype(np.float32)
+            
+            # 使用 warpAffine 进行全局变换
+            warped = cv2.warpAffine(
+                mss_band,
+                M,
+                (pan_w, pan_h),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0
+            )
+            
+            dst.write(warped, b + 1)
+    
+    return output_path
+
+
 def fuse_scene(
     scene_name: str,
     scene_dir: str,
@@ -187,6 +266,8 @@ def fuse_scene(
     配准流程：
     1. RPC 粗配准 - 使用原始尺寸计算全局偏移
     2. 特征点精配准 - 在采样数据上进行 ORB 匹配
+    3. 全局 warp MSS 到 PAN 尺寸（避免分块边界问题）
+    4. 分块锐化
     
     Returns:
         融合结果信息，包含输出路径和元数据
@@ -297,6 +378,16 @@ def fuse_scene(
         print(f"[总偏移] dx={total_offset_pan[0]:.2f}, dy={total_offset_pan[1]:.2f} (PAN 像素)")
         
         # ================================================================
+        # 全局 warp MSS 到 PAN 尺寸（避免分块边界问题）
+        # ================================================================
+        mss_warped_path = os.path.join(fused_dir, 'mss_warped_temp.tif')
+        warp_mss_to_pan_size(
+            mss_ds, pan_w, pan_h, num_bands,
+            total_offset_pan, scale_x, scale_y,
+            mss_warped_path
+        )
+        
+        # ================================================================
         # 计算全局权重
         # ================================================================
         print("计算全局锐化权重...")
@@ -304,7 +395,7 @@ def fuse_scene(
         print(f"权重: {global_weights}")
         
         # ================================================================
-        # 分块处理
+        # 分块处理（从 warped MSS 读取）
         # ================================================================
         tile_size = TILE_SIZE
         overlap = OVERLAP
@@ -327,9 +418,12 @@ def fuse_scene(
                 blockxsize=256,
                 blockysize=256,
             )
-            fused_ds = rasterio.open(tiff_path, 'w', **profile)
+            fused_out_ds = rasterio.open(tiff_path, 'w', **profile)
         else:
-            fused_ds = None
+            fused_out_ds = None
+        
+        # 打开 warped MSS
+        mss_warped_ds = rasterio.open(mss_warped_path)
         
         # 分块处理
         processed = 0
@@ -351,51 +445,34 @@ def fuse_scene(
                 pan_window = Window(pan_x0, pan_y0, tile_w, tile_h)
                 pan_tile = pan_ds.read(1, window=pan_window)
                 
-                # 计算对应的 MSS 范围（应用总偏移）
-                # 偏移是 MSS 相对于 PAN 的位移，所以 MSS 窗口要减去偏移
-                mss_x0 = int((pan_x0 - total_offset_pan[0]) / scale_x)
-                mss_y0 = int((pan_y0 - total_offset_pan[1]) / scale_y)
-                mss_x1 = int((pan_x1 - total_offset_pan[0]) / scale_x) + 1
-                mss_y1 = int((pan_y1 - total_offset_pan[1]) / scale_y) + 1
-                
-                # 裁剪到有效范围
-                mss_x0 = max(0, mss_x0)
-                mss_y0 = max(0, mss_y0)
-                mss_x1 = min(mss_w, mss_x1)
-                mss_y1 = min(mss_h, mss_y1)
-                
-                if mss_x1 <= mss_x0 or mss_y1 <= mss_y0:
-                    # MSS 窗口无效，用零填充
-                    mss_aligned = np.zeros((num_bands, tile_h, tile_w), dtype=np.float32)
-                else:
-                    # 读取 MSS 分块
-                    mss_window = Window(mss_x0, mss_y0, mss_x1 - mss_x0, mss_y1 - mss_y0)
-                    mss_tile = np.stack([
-                        mss_ds.read(b + 1, window=mss_window)
-                        for b in range(num_bands)
-                    ], axis=0)
-                    
-                    # 重采样 MSS 到 PAN 分辨率
-                    mss_aligned = np.stack([
-                        cv2.resize(mss_tile[b], (tile_w, tile_h), interpolation=cv2.INTER_CUBIC)
-                        for b in range(num_bands)
-                    ], axis=0)
+                # 直接从 warped MSS 读取对应区域（已经是 PAN 尺寸，无需 resize）
+                mss_aligned = mss_warped_ds.read(window=pan_window)
                 
                 # 全色锐化（使用全局权重）
                 mss_bands = [mss_aligned[b] for b in range(num_bands)]
                 fused_bands = gram_schmidt_sharpen(pan_tile, mss_bands, global_weights)
                 
                 # 写入输出
-                if fused_ds:
+                if fused_out_ds:
                     for b, band in enumerate(fused_bands):
-                        fused_ds.write(band.astype(np.float32), b + 1, window=pan_window)
+                        fused_out_ds.write(band.astype(np.float32), b + 1, window=pan_window)
                 
                 processed += 1
                 if processed % 10 == 0 or processed == total_tiles:
                     print(f"  进度: {processed}/{total_tiles} ({100*processed/total_tiles:.1f}%)")
         
-        if fused_ds:
-            fused_ds.close()
+        # 关闭 warped MSS
+        mss_warped_ds.close()
+        
+        # 删除临时文件
+        try:
+            os.remove(mss_warped_path)
+            print(f"已删除临时文件: {mss_warped_path}")
+        except Exception as e:
+            print(f"[warn] 无法删除临时文件: {e}")
+        
+        if fused_out_ds:
+            fused_out_ds.close()
             print(f"保存 TIFF: {tiff_path}")
         
         # 生成 PNG 预览（降采样）
@@ -421,7 +498,9 @@ def fuse_scene(
                     for _ in range(num_bands)
                 ], axis=0)
             
-            rgb = bands_to_rgb_uint8(preview_data)
+            # 只用 BGR 三个波段，不注入 NIR
+            rgb_bands = [preview_data[i] for i in range(min(3, preview_data.shape[0]))]
+            rgb = bands_to_rgb_uint8(rgb_bands)
             Image.fromarray(rgb).save(png_path)
             print(f"保存 PNG 预览: {png_path}")
         
@@ -557,8 +636,9 @@ def crop_detections(
                 crop_window = Window(crop_x, crop_y, crop_w, crop_h)
                 crop_data = fused_ds.read(window=crop_window)
                 
-                # 转换为 RGB 并保存
-                rgb = bands_to_rgb_uint8(crop_data)
+                # 转换为 RGB 并保存（只用 BGR 三个波段，不注入 NIR）
+                rgb_bands = [crop_data[i] for i in range(min(3, crop_data.shape[0]))]
+                rgb = bands_to_rgb_uint8(rgb_bands)
                 
                 crop_path = os.path.join(crops_dir, f"det_{det_idx:03d}.png")
                 Image.fromarray(rgb).save(crop_path)
