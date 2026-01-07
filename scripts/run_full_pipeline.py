@@ -42,7 +42,7 @@ OUTPUT_DIR = r"F:\1218\output"                   # 输出根目录
 
 # 融合参数
 TILE_SIZE = 4096                        # 分块大小（处理大图时分块）
-OVERLAP = 256                           # 分块重叠
+OVERLAP = 0                           # 分块重叠
 SHARPEN_METHOD = "gram_schmidt"         # 锐化方法
 REGISTRATION_SAMPLE_SIZE = 8000         # 配准采样尺寸（越大越精确，但更慢）
 SAVE_FUSED_TIFF = True                  # 是否保存融合后的 TIFF
